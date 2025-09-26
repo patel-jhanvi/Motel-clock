@@ -1,44 +1,32 @@
-"use client";
-
-import Image from "next/image";
 import Link from "next/link";
 
-export default function Home() {
+export default function HomePage() {
   return (
-    <main className="flex min-h-screen flex-col items-center justify-center bg-white p-6">
-      {/* Logo */}
-      <div className="mb-8">
-        <Image
-          src="/logos/logo.png"
-          alt="Microtel by Wyndham"
-          width={250}
-          height={100}
-          priority
-        />
-      </div>
-
-      <h1 className="text-2xl font-bold text-[#002B5C] mb-8">
+    <main className="flex flex-col items-center justify-center min-h-[calc(100vh-100px)] bg-[#F9FAFB] px-4">
+      <h1 className="text-2xl font-bold text-[#1E3A8A] mb-6 text-center">
         Welcome to Employee Clock System
       </h1>
 
-      <div className="flex gap-6">
-        <Link
-          href="/signup"
-          className="px-6 py-3 bg-[#002B5C] text-white rounded-lg font-medium hover:bg-[#004080]"
-        >
-          Signup
+      <div className="flex space-x-4">
+        {/* Signup */}
+        <Link href="/signup">
+          <button className="px-6 py-3 bg-[#2563EB] text-white rounded-md font-semibold hover:bg-[#1E40AF]">
+            Signup
+          </button>
         </Link>
-        <Link
-          href="/login"
-          className="px-6 py-3 bg-[#002B5C] text-white rounded-lg font-medium hover:bg-[#004080]"
-        >
-          Login
+
+        {/* Login */}
+        <Link href="/login">
+          <button className="px-6 py-3 bg-[#2563EB] text-white rounded-md font-semibold hover:bg-[#1E40AF]">
+            Login
+          </button>
         </Link>
-        <Link
-          href="/admin/login"
-          className="px-6 py-3 bg-gray-600 text-white rounded-lg font-medium hover:bg-gray-800"
-        >
-          Manager
+
+        {/* Manager - FIX HERE */}
+        <Link href="/admin/login">
+          <button className="px-6 py-3 bg-gray-600 text-white rounded-md font-semibold hover:bg-gray-700">
+            Manager
+          </button>
         </Link>
       </div>
     </main>
