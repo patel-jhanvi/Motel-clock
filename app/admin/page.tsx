@@ -2,42 +2,31 @@
 
 import { useState } from "react";
 import { db } from "@/lib/firebase";
-import { collection, query, where, getDocs } from "firebase/firestore";
+import { collection, addDoc } from "firebase/firestore";
 import { useRouter } from "next/navigation";
 
-export default function ManagerLogin() {
+export default function ManagerSignup() {
     const router = useRouter();
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
     const [error, setError] = useState("");
 
-    const handleLogin = async (e: React.FormEvent) => {
+    const handleSignup = async (e: React.FormEvent) => {
         e.preventDefault();
         setError("");
 
         try {
-            const q = query(collection(db, "managers"), where("email", "==", email));
-            const snapshot = await getDocs(q);
+            // Save manager info in Firestore
+            await addDoc(collection(db, "managers"), {
+                email,
+                password,
+                createdAt: new Date(),
+            });
 
-            if (snapshot.empty) {
-                setError("No manager found with that email.");
-                return;
-            }
-
-            let managerDoc: any = null;
-            snapshot.forEach((doc) => (managerDoc = doc.data()));
-
-            if (managerDoc.password !== password) {
-                setError("Incorrect password.");
-                return;
-            }
-
-            // ✅ Save session
-            sessionStorage.setItem("currentManagerEmail", email);
-
-            router.push("/admin/dashboard");
+            alert("✅ Manager account created. Please log in.");
+            router.push("/admin/login");
         } catch (err: any) {
-            setError("Login failed. Try again.");
+            setError("Signup failed. Try again.");
         }
     };
 
@@ -45,10 +34,10 @@ export default function ManagerLogin() {
         <main className="flex min-h-screen flex-col items-center justify-center bg-[#F9FAFB] px-4">
             <div className="bg-white shadow-lg rounded-lg p-8 w-full max-w-md border border-gray-200">
                 <h1 className="text-2xl font-bold text-[#1E3A8A] mb-6 text-center">
-                    Manager Login
+                    Manager Signup
                 </h1>
 
-                <form onSubmit={handleLogin} className="space-y-4">
+                <form onSubmit={handleSignup} className="space-y-4">
                     <input
                         type="email"
                         placeholder="Email"
@@ -73,17 +62,17 @@ export default function ManagerLogin() {
                         type="submit"
                         className="w-full py-3 bg-[#2563EB] text-white rounded-md font-semibold hover:bg-[#1E40AF] transition"
                     >
-                        Login
+                        Create Account
                     </button>
                 </form>
 
                 <p className="mt-4 text-center text-sm text-gray-600">
-                    Don’t have an account?{" "}
+                    Already have an account?{" "}
                     <span
-                        onClick={() => router.push("/admin/signup")}
+                        onClick={() => router.push("/admin/login")}
                         className="text-[#2563EB] cursor-pointer hover:underline"
                     >
-                        Create one
+                        Login
                     </span>
                 </p>
             </div>

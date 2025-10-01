@@ -28,20 +28,21 @@ export default function Navbar() {
 
     return (
         <header className="flex items-center justify-between px-8 py-3 bg-[#F9FAFB] border-b-4 border-[#2563EB] shadow-sm">
-            {/* Logo on the left */}
-            <Link href="/">
+            {/* Logo on the left - goes to main dashboard with 3 buttons */}
+            <Link href="/" className="flex items-center cursor-pointer">
                 <Image
                     src="/logos/logo.png"
                     alt="ShiftTrack Logo"
                     width={160}
                     height={65}
                     priority
-                    className="cursor-pointer"
                 />
             </Link>
 
             {/* Clock on the right */}
-            <div className="text-lg font-semibold text-[#111827]">{time}</div>
+            <div className="text-lg font-semibold text-[#111827]">
+                {time}
+            </div>
         </header>
     );
 }

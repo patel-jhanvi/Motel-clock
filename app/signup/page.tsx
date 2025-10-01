@@ -1,83 +1,133 @@
 "use client";
-
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { db } from "@/lib/firebase";
+import { collection, addDoc } from "firebase/firestore";
 import { useRouter } from "next/navigation";
 
 export default function SignupPage() {
-    const [fullName, setFullName] = useState("");
-    const [role, setRole] = useState("");
-    const [password, setPassword] = useState("");
-    const [pin, setPin] = useState<string | null>(null);
     const router = useRouter();
+    const [name, setName] = useState("");
+    const [password, setPassword] = useState("");
+    const [role, setRole] = useState("Front Desk");
+    const [employeeId, setEmployeeId] = useState("");
+    const [showPopup, setShowPopup] = useState(false);
+    const [timeLeft, setTimeLeft] = useState(60);
 
-    const handleSignup = (e: React.FormEvent) => {
+    const handleSignup = async (e: React.FormEvent) => {
         e.preventDefault();
+        try {
+            // Generate unique Employee ID
+            const empId = "EMP" + Math.floor(1000 + Math.random() * 9000);
+            setEmployeeId(empId);
 
-        // Generate random 4-digit PIN
-        const newPin = Math.floor(1000 + Math.random() * 9000).toString();
-        setPin(newPin);
+            // Save employee in Firestore
+            await addDoc(collection(db, "employees"), {
+                name,
+                password,
+                role,
+                employeeId: empId,
+                createdAt: new Date().toISOString(),
+            });
 
-        console.log("Signup", { fullName, role, password, pin: newPin });
+            // Show popup
+            setShowPopup(true);
+            setTimeLeft(60);
+        } catch (error: any) {
+            alert(error.message);
+        }
+    };
 
-        // TODO: Save to Firebase later
+    // Auto-redirect countdown
+    useEffect(() => {
+        if (showPopup && timeLeft > 0) {
+            const timer = setTimeout(() => setTimeLeft(timeLeft - 1), 1000);
+            return () => clearTimeout(timer);
+        } else if (showPopup && timeLeft === 0) {
+            router.push("/login");
+        }
+    }, [showPopup, timeLeft, router]);
+
+    const copyToClipboard = () => {
+        navigator.clipboard.writeText(employeeId);
+        alert("Copied Employee ID: " + employeeId);
     };
 
     return (
-        <main className="flex min-h-[calc(100vh-100px)] flex-col items-center justify-center bg-[#F9FAFB] px-4">
+        <main className="flex min-h-screen flex-col items-center justify-center bg-[#F9FAFB] px-4">
             <div className="bg-white shadow-lg rounded-lg p-8 w-full max-w-md border border-gray-200">
                 <h1 className="text-2xl font-bold text-[#1E3A8A] mb-6 text-center">
-                    Create Your Employee Account
+                    Employee Signup
                 </h1>
 
                 <form onSubmit={handleSignup} className="space-y-4">
                     <input
                         type="text"
                         placeholder="Full Name"
-                        value={fullName}
-                        onChange={(e) => setFullName(e.target.value)}
+                        value={name}
+                        onChange={(e) => setName(e.target.value)}
                         required
-                        className="w-full px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
+                        className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-[#2563EB] text-gray-800"
                     />
-
-                    <select
-                        value={role}
-                        onChange={(e) => setRole(e.target.value)}
-                        required
-                        className="w-full px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
-                    >
-                        <option value="">Select Role</option>
-                        <option value="Front Desk">Front Desk</option>
-                        <option value="Housekeeping">Housekeeping</option>
-                        <option value="Maintenance">Maintenance</option>
-                        <option value="Other">Other</option>
-                    </select>
-
                     <input
                         type="password"
                         placeholder="Password"
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}
                         required
-                        className="w-full px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
+                        className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-[#2563EB] text-gray-800"
                     />
+
+                    {/* Role Dropdown */}
+                    <select
+                        value={role}
+                        onChange={(e) => setRole(e.target.value)}
+                        className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-[#2563EB] text-gray-800"
+                    >
+                        <option>Front Desk</option>
+                        <option>Maintenance</option>
+                        <option>Other</option>
+                    </select>
 
                     <button
                         type="submit"
                         className="w-full py-3 bg-[#2563EB] text-white rounded-md font-semibold hover:bg-[#1E40AF] transition"
                     >
-                        Create Account
+                        Sign Up
                     </button>
                 </form>
 
-                {pin && (
-                    <div className="mt-6 text-center">
-                        <p className="text-gray-600">Your generated PIN: {pin}</p>
+                {/* Success Popup */}
+                {showPopup && (
+                    <div className="mt-6 bg-gray-50 border border-gray-200 rounded-lg p-4 text-center">
+                        <h3 className="text-lg font-semibold text-[#1E3A8A]">Account Created</h3>
+                        <p>Your Employee ID:</p>
+                        <p className="font-mono text-xl text-[#2563EB]">{employeeId}</p>
+
                         <button
-                            onClick={() => router.push("/login")}
-                            className="mt-3 bg-[#2563EB] text-white px-4 py-2 rounded-md hover:bg-[#1E40AF] transition"
+                            onClick={copyToClipboard}
+                            className="bg-gray-700 text-white px-3 py-1 rounded mt-2 hover:bg-gray-900"
                         >
-                            Go to Login
+                            Copy ID
                         </button>
+
+                        <p className="text-gray-600 text-sm mt-2">
+                            Redirecting to login in <b>{timeLeft}s</b>
+                        </p>
+
+                        <div className="flex gap-2 justify-center mt-3">
+                            <button
+                                onClick={() => setTimeLeft(timeLeft + 60)}
+                                className="bg-gray-300 text-black px-3 py-1 rounded font-medium hover:bg-gray-400"
+                            >
+                                More Time (+60s)
+                            </button>
+                            <button
+                                onClick={() => router.push("/login")}
+                                className="bg-[#2563EB] text-white px-3 py-1 rounded font-medium hover:bg-[#1E40AF]"
+                            >
+                                Login Now
+                            </button>
+                        </div>
                     </div>
                 )}
             </div>
