@@ -2,47 +2,30 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { useEffect, useState } from "react";
 
 export default function Navbar() {
-    const [time, setTime] = useState("");
-
-    useEffect(() => {
-        const interval = setInterval(() => {
-            const now = new Date();
-            const options: Intl.DateTimeFormatOptions = {
-                weekday: "long",
-                year: "numeric",
-                month: "long",
-                day: "numeric",
-                hour: "2-digit",
-                minute: "2-digit",
-                second: "2-digit",
-                timeZone: "America/New_York",
-            };
-            setTime(now.toLocaleString("en-US", options));
-        }, 1000);
-
-        return () => clearInterval(interval);
-    }, []);
-
     return (
         <header className="flex items-center justify-between px-8 py-3 bg-[#F9FAFB] border-b-4 border-[#2563EB] shadow-sm">
-            {/* Logo on the left - goes to main dashboard with 3 buttons */}
+            {/* Logo */}
             <Link href="/" className="flex items-center cursor-pointer">
                 <Image
                     src="/logos/logo.png"
                     alt="ShiftTrack Logo"
                     width={160}
-                    height={65}
+                    height={100}
                     priority
                 />
             </Link>
 
-            {/* Clock on the right */}
-            <div className="text-lg font-semibold text-[#111827]">
-                {time}
-            </div>
+            {/* Right Side Links */}
+            <nav className="flex gap-6 text-sm font-semibold text-[#1E3A8A]">
+                <Link href="/login" className="hover:text-[#2563EB]">
+                    Employee
+                </Link>
+                <Link href="/admin/login" className="hover:text-[#2563EB]">
+                    Manager
+                </Link>
+            </nav>
         </header>
     );
 }

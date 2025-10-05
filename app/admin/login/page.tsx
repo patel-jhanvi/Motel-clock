@@ -1,14 +1,13 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { db } from "@/lib/firebase";
-import { collection, query, where, getDocs } from "firebase/firestore";
+import { doc, getDoc } from "firebase/firestore";
 import { useRouter } from "next/navigation";
 
 export default function ManagerLogin() {
     const router = useRouter();
-    const [email, setEmail] = useState("");
-    const [password, setPassword] = useState("");
+    const [pin, setPin] = useState("");
     const [error, setError] = useState("");
 
     const handleLogin = async (e: React.FormEvent) => {
@@ -16,28 +15,19 @@ export default function ManagerLogin() {
         setError("");
 
         try {
-            const q = query(collection(db, "managers"), where("email", "==", email));
-            const snapshot = await getDocs(q);
+            // 🔒 Read manager PIN from Firestore doc
+            const pinDoc = await getDoc(doc(db, "config", "manager"));
+            const validPin = pinDoc.exists() ? pinDoc.data().pin : null;
 
-            if (snapshot.empty) {
-                setError("No manager found with that email.");
-                return;
+            if (pin === validPin) {
+                sessionStorage.setItem("managerAuth", "true");
+                router.push("/admin/dashboard");
+            } else {
+                setError("Invalid PIN. Access denied.");
             }
-
-            let managerDoc: any = null;
-            snapshot.forEach((doc) => (managerDoc = doc.data()));
-
-            if (managerDoc.password !== password) {
-                setError("Incorrect password.");
-                return;
-            }
-
-            // ✅ Save session
-            sessionStorage.setItem("currentManagerEmail", email);
-
-            router.push("/admin/dashboard");
-        } catch (err: any) {
-            setError("Login failed. Try again.");
+        } catch (err) {
+            console.error(err);
+            setError("Something went wrong. Try again.");
         }
     };
 
@@ -45,47 +35,28 @@ export default function ManagerLogin() {
         <main className="flex min-h-screen flex-col items-center justify-center bg-[#F9FAFB] px-4">
             <div className="bg-white shadow-lg rounded-lg p-8 w-full max-w-md border border-gray-200">
                 <h1 className="text-2xl font-bold text-[#1E3A8A] mb-6 text-center">
-                    Manager Login
+                    Manager Access
                 </h1>
 
                 <form onSubmit={handleLogin} className="space-y-4">
                     <input
-                        type="email"
-                        placeholder="Email"
-                        value={email}
-                        onChange={(e) => setEmail(e.target.value)}
-                        required
-                        className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-[#2563EB] text-gray-800"
-                    />
-
-                    <input
                         type="password"
-                        placeholder="Password"
-                        value={password}
-                        onChange={(e) => setPassword(e.target.value)}
+                        placeholder="Enter Manager PIN"
+                        value={pin}
+                        onChange={(e) => setPin(e.target.value)}
                         required
-                        className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-[#2563EB] text-gray-800"
+                        className="w-full px-4 py-3 border border-gray-300 rounded-md focus:ring-2 focus:ring-[#2563EB] text-gray-800 text-lg"
                     />
 
                     {error && <p className="text-red-500 text-sm text-center">{error}</p>}
 
                     <button
                         type="submit"
-                        className="w-full py-3 bg-[#2563EB] text-white rounded-md font-semibold hover:bg-[#1E40AF] transition"
+                        className="w-full py-3 bg-[#2563EB] text-white rounded-md font-semibold text-lg hover:bg-[#1E40AF] transition"
                     >
-                        Login
+                        Access Dashboard
                     </button>
                 </form>
-
-                <p className="mt-4 text-center text-sm text-gray-600">
-                    Don’t have an account?{" "}
-                    <span
-                        onClick={() => router.push("/admin/signup")}
-                        className="text-[#2563EB] cursor-pointer hover:underline"
-                    >
-                        Create one
-                    </span>
-                </p>
             </div>
         </main>
     );
