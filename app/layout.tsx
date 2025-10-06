@@ -5,6 +5,9 @@ import Navbar from "@/components/Navbar";
 export const metadata: Metadata = {
   title: "ShiftTrack",
   description: "Motel employee tracking system",
+  icons: {
+    icon: "/favicon.png", // ✅ Add this line
+  },
 };
 
 export default function RootLayout({
