@@ -1,12 +1,13 @@
 import "./globals.css";
 import type { Metadata } from "next";
 import Navbar from "@/components/Navbar";
+import Footer from "@/components/footer";
 
 export const metadata: Metadata = {
   title: "ShiftTrack",
   description: "Motel employee tracking system",
   icons: {
-    icon: "/favicon.png", // ✅ Add this line
+    icon: "/favicon.png",
   },
 };
 
@@ -22,6 +23,7 @@ export default function RootLayout({
         <main className="flex flex-col items-center justify-center min-h-[calc(100vh-80px)] px-4">
           {children}
         </main>
+        <Footer />
       </body>
     </html>
   );
