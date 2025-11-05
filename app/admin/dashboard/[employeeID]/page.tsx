@@ -1,559 +1,582 @@
 "use client";
 
-import React, { useEffect, useState, useMemo } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { db } from "@/lib/firebase";
 import {
+    addDoc,
     collection,
-    getDocs,
-    query,
-    where,
     doc,
-    updateDoc,
+    getDocs,
+    orderBy,
+    query,
     Timestamp,
+    updateDoc,
+    where,
 } from "firebase/firestore";
 
-interface Log {
+/** ===== Types ===== */
+type Log = {
     id: string;
     employeeId: string;
     employeeName: string;
     type: "in" | "out";
-    time: any;
+    time: any; // Firestore Timestamp
     autoClockOut?: boolean;
     edited?: boolean;
     managerNote?: string;
-    originalTime?: any;
-}
+};
 
-interface DailyLog {
-    date: string;
-    clockIn: Date | null;
-    clockOut: Date | null;
+type DayRow = {
+    dateISO: string;         // yyyy-mm-dd (local)
+    displayDate: string;     // locale date
+    in?: Log;
+    out?: Log;
     hours: number;
-    runningTotal: number;
-    hasWarning: boolean;
-    logId: string;
-    note?: string;
-}
+    warning: boolean;
+};
 
-/* ===================== Pay Period Helpers (ADD-ON) ===================== */
+/** ===== Date helpers (Sunday–Saturday week) ===== */
+const pad2 = (n: number) => String(n).padStart(2, "0");
+const fmt = (d: Date) => `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`;
+const toISO = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+
 const startOfWeekSun = (d: Date) => {
     const x = new Date(d);
-    const day = x.getDay(); // 0=Sun
-    x.setDate(x.getDate() - day);
+    const day = x.getDay(); // 0 = Sun
     x.setHours(0, 0, 0, 0);
+    x.setDate(x.getDate() - day);
     return x;
 };
+const endOfWeekSat = (d: Date) => {
+    const s = startOfWeekSun(d);
+    const e = new Date(s);
+    e.setDate(s.getDate() + 6);
+    e.setHours(23, 59, 59, 999);
+    return e;
+};
+const weekLabel = (start: Date) => {
+    const end = endOfWeekSat(start);
+    return `This Week (${fmt(start)} - ${fmt(end)})`;
+};
 
-const biweeklyFromWeekStart = (weekStart: Date) => {
-    // CHANGE this if your biweekly anchor Sunday differs
-    const anchor = startOfWeekSun(new Date("2024-01-07")); // a Sunday anchor
-    const thisStart = startOfWeekSun(weekStart);
+/** Build week dropdown: current week back N weeks */
+const buildWeekOptions = (howMany = 16) => {
+    const now = new Date();
+    const startThis = startOfWeekSun(now);
+    const opts: { key: string; start: Date; end: Date; label: string }[] = [];
+    for (let i = 0; i < howMany; i++) {
+        const s = new Date(startThis);
+        s.setDate(startThis.getDate() - 7 * i);
+        const e = endOfWeekSat(s);
+        opts.push({
+            key: `${toISO(s)}_${toISO(e)}`,
+            start: s,
+            end: e,
+            label: i === 0 ? weekLabel(s) : `${fmt(s)} - ${fmt(e)}`,
+        });
+    }
+    return opts;
+};
 
-    const diffDays = Math.floor(
-        (thisStart.getTime() - anchor.getTime()) / 86400000
+/** ===== robust pairing logic (fixes 0 hrs & cross-midnight) ===== */
+const toLocalISODate = (d: Date) => toISO(d);
+
+/**
+ * Build daily rows:
+ *  - sort ASC
+ *  - group by local date
+ *  - each day = earliest IN + latest OUT
+ *  - if an OUT has no same-day IN but there’s an unmatched previous-day IN within 16h,
+ *    attribute the hours to the previous day (overnight shift)
+ */
+function buildDailyRows(entries: Log[]): DayRow[] {
+    const asc = [...entries].sort(
+        (a, b) => a.time.toDate().getTime() - b.time.toDate().getTime()
     );
-    const weekOffset = Math.floor(diffDays / 7);
-    const inOddBlock = weekOffset % 2 !== 0;
+    const byDate = new Map<string, Log[]>();
+    for (const lg of asc) {
+        const dt = lg.time.toDate();
+        const key = toLocalISODate(dt);
+        if (!byDate.has(key)) byDate.set(key, []);
+        byDate.get(key)!.push(lg);
+    }
 
-    const periodStart = new Date(thisStart);
-    if (inOddBlock) periodStart.setDate(periodStart.getDate() - 7);
-    const periodEnd = new Date(periodStart);
-    periodEnd.setDate(periodStart.getDate() + 13);
-    periodEnd.setHours(23, 59, 59, 999);
+    let carryIn: Log | undefined; // unmatched previous-day IN
+    const keys = [...byDate.keys()].sort();
+    const rows: DayRow[] = [];
 
-    return { periodStart, periodEnd };
-};
+    for (const key of keys) {
+        const list = byDate.get(key)!;
+        const displayDate = new Date(key + "T00:00:00").toLocaleDateString();
 
-const fmtPayRange = (a: Date, b: Date) => {
-    const fmt = (d: Date) =>
-        d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-    return `${fmt(a)} – ${fmt(b)}`;
-};
-/* ====================================================================== */
+        const firstIn = list.find((l) => l.type === "in");
+        const lastOut = [...list].reverse().find((l) => l.type === "out");
 
+        let useIn = firstIn;
+        let useOut = lastOut;
+        let warning = !!lastOut?.autoClockOut;
+
+        // cross-midnight stitch: OUT today but only IN yesterday
+        if (!useIn && useOut && carryIn) {
+            const diff = useOut.time.toDate().getTime() - carryIn.time.toDate().getTime();
+            const hours = diff / 3600000;
+            if (hours > 0 && hours <= 16) {
+                const prevKey = toLocalISODate(carryIn.time.toDate());
+                let prevRow = rows.find((r) => r.dateISO === prevKey);
+                if (!prevRow) {
+                    prevRow = {
+                        dateISO: prevKey,
+                        displayDate: new Date(prevKey + "T00:00:00").toLocaleDateString(),
+                        in: carryIn,
+                        out: undefined,
+                        hours: 0,
+                        warning: !!useOut.autoClockOut,
+                    };
+                    rows.push(prevRow);
+                }
+                prevRow.out = useOut;
+                prevRow.warning = prevRow.warning || !!useOut.autoClockOut;
+                prevRow.hours = Math.max(0, diff / 3600000);
+
+                // current day still shows OUT only (0 hrs)
+                rows.push({
+                    dateISO: key,
+                    displayDate,
+                    in: undefined,
+                    out: useOut,
+                    hours: 0,
+                    warning: !!useOut.autoClockOut,
+                });
+
+                carryIn = undefined;
+                continue;
+            }
+        }
+
+        // IN but no OUT → keep carry for tomorrow
+        if (useIn && !useOut) {
+            rows.push({
+                dateISO: key,
+                displayDate,
+                in: useIn,
+                out: undefined,
+                hours: 0,
+                warning: false,
+            });
+            carryIn = useIn;
+            continue;
+        }
+
+        // normal same-day
+        const row: DayRow = {
+            dateISO: key,
+            displayDate,
+            in: useIn,
+            out: useOut,
+            hours: 0,
+            warning,
+        };
+        if (useIn && useOut) {
+            const ms = useOut.time.toDate().getTime() - useIn.time.toDate().getTime();
+            row.hours = ms > 0 ? ms / 3600000 : 0;
+        }
+        rows.push(row);
+        carryIn = useIn && !useOut ? useIn : undefined;
+    }
+
+    // newest first for table
+    return rows.sort((a, b) => (a.dateISO < b.dateISO ? 1 : -1));
+}
+
+/** ===== Page ===== */
 export default function EmployeeDetail() {
     const params = useParams();
     const router = useRouter();
 
+    // tolerate [employeeID] vs [employeeId]
     const employeeId = useMemo(() => {
-        const idParam = params?.employeeID || params?.employeeId;
-        if (!idParam) return "";
-        if (Array.isArray(idParam)) return idParam[0];
-        return idParam as string;
+        const raw: any = (params as any)?.employeeID ?? (params as any)?.employeeId;
+        return Array.isArray(raw) ? raw[0] : (raw as string | undefined);
     }, [params]);
 
-    const [logs, setLogs] = useState<Log[]>([]);
-    const [allDailyLogs, setAllDailyLogs] = useState<DailyLog[]>([]);
-    const [employeeName, setEmployeeName] = useState("Loading...");
-    const [selectedDate, setSelectedDate] = useState("");
-    const [weekOptions, setWeekOptions] = useState<
-        Array<{ label: string; start: Date; end: Date }>
-    >([]);
-    const [selectedWeekIndex, setSelectedWeekIndex] = useState(0);
-    const [showAllDates, setShowAllDates] = useState(false);
+    const [name, setName] = useState("Loading…");
+    const [allRows, setAllRows] = useState<DayRow[]>([]);
     const [loading, setLoading] = useState(true);
-    const [error, setError] = useState("");
-    const [editModal, setEditModal] = useState<{
-        show: boolean;
-        log: DailyLog | null;
-    }>({ show: false, log: null });
-    const [editTime, setEditTime] = useState("");
-    const [editNote, setEditNote] = useState("");
 
-    // Generate last 30 weeks (Sunday to Saturday pay periods)
+    // UI: date pick + week select
+    const weekOptions = useMemo(() => buildWeekOptions(16), []);
+    const [selectedDate, setSelectedDate] = useState<string>(""); // mm/dd/yyyy
+    const [selectedWeekKey, setSelectedWeekKey] = useState<string>(
+        `${toISO(startOfWeekSun(new Date()))}_${toISO(endOfWeekSat(new Date()))}`
+    );
+    const [showAllDates, setShowAllDates] = useState(false);
+
+    // Edit modal
+    const [modal, setModal] = useState<{
+        open: boolean;
+        kind: "in" | "out";
+        dateISO?: string;
+        logId?: string;
+        time?: string; // "HH:MM"
+        note?: string;
+    }>({ open: false, kind: "out" });
+
+    /** Fetch logs (last 8 weeks window) with robust calc */
     useEffect(() => {
-        const weeks: Array<{ label: string; start: Date; end: Date }> = [];
-        const today = new Date();
+        if (!employeeId) return;
+        (async () => {
+            setLoading(true);
+            const start = new Date();
+            start.setDate(start.getDate() - 56);
 
-        for (let i = 0; i < 30; i++) {
-            // Calculate week start (Sunday)
-            const weekStart = new Date(today);
-            const daysToSubtract = today.getDay() + i * 7;
-            weekStart.setDate(today.getDate() - daysToSubtract);
-            weekStart.setHours(0, 0, 0, 0);
+            // ASC is important for pairing logic
+            const qy = query(
+                collection(db, "logs"),
+                where("employeeId", "==", employeeId),
+                where("time", ">=", Timestamp.fromDate(start)),
+                orderBy("time", "asc")
+            );
+            const snap = await getDocs(qy);
+            const entries = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Log));
 
-            // Calculate week end (Saturday)
-            const weekEnd = new Date(weekStart);
-            weekEnd.setDate(weekStart.getDate() + 6);
-            weekEnd.setHours(23, 59, 59, 999);
+            if (entries[0]?.employeeName) setName(entries[0].employeeName);
+            else setName("Unknown Employee");
 
-            const startStr = `${weekStart.getMonth() + 1}/${weekStart.getDate()}/${weekStart.getFullYear()}`;
-            const endStr = `${weekEnd.getMonth() + 1}/${weekEnd.getDate()}/${weekEnd.getFullYear()}`;
-
-            weeks.push({
-                label:
-                    i === 0
-                        ? `This Week (${startStr} - ${endStr})`
-                        : i === 1
-                            ? `Last Week (${startStr} - ${endStr})`
-                            : `${i} weeks ago (${startStr} - ${endStr})`,
-                start: weekStart,
-                end: weekEnd,
-            });
-        }
-
-        setWeekOptions(weeks);
-    }, []);
-
-    useEffect(() => {
-        const fetchLogs = async () => {
-            if (!employeeId) return;
-            try {
-                setLoading(true);
-                const q = query(collection(db, "logs"), where("employeeId", "==", employeeId));
-                const snapshot = await getDocs(q);
-
-                if (snapshot.empty) {
-                    setEmployeeName("Unknown Employee");
-                    setError("No logs found for this employee");
-                    setLoading(false);
-                    return;
-                }
-
-                const entries = snapshot.docs.map((docu) => ({
-                    id: docu.id,
-                    ...docu.data(),
-                })) as Log[];
-
-                // Sort in code instead of in query
-                entries.sort((a, b) => a.time.seconds - b.time.seconds);
-
-                setLogs(entries);
-                setEmployeeName(entries[0].employeeName || "Unknown Employee");
-
-                const dailyData = processDailyLogs(entries);
-                setAllDailyLogs(dailyData);
-
-                setLoading(false);
-            } catch (err) {
-                setError("Error loading employee data: " + (err as Error).message);
-                setEmployeeName("Error");
-                setLoading(false);
-            }
-        };
-
-        fetchLogs();
+            setAllRows(buildDailyRows(entries));
+            setLoading(false);
+        })();
     }, [employeeId]);
 
-    const processDailyLogs = (logs: Log[]): DailyLog[] => {
-        const dailyMap = new Map<string, DailyLog>();
+    /** Filter by selected week unless "Show All Dates" is ON */
+    const filteredRows = useMemo(() => {
+        if (showAllDates) return allRows;
 
-        for (let log of logs) {
-            const date = new Date(log.time.seconds * 1000).toLocaleDateString();
+        const opt = weekOptions.find((o) => o.key === selectedWeekKey);
+        if (!opt) return allRows;
 
-            if (!dailyMap.has(date)) {
-                dailyMap.set(date, {
-                    date,
-                    clockIn: null,
-                    clockOut: null,
-                    hours: 0,
-                    runningTotal: 0,
-                    hasWarning: false,
-                    logId: log.id,
-                    note: "",
-                });
-            }
-
-            const entry = dailyMap.get(date)!;
-
-            if (log.type === "in") {
-                entry.clockIn = new Date(log.time.seconds * 1000);
-            } else if (log.type === "out") {
-                entry.clockOut = new Date(log.time.seconds * 1000);
-                entry.logId = log.id; // Use OUT log ID for editing
-                entry.hasWarning = log.autoClockOut || false;
-                entry.note = log.managerNote || "";
-            }
-        }
-
-        const result = Array.from(dailyMap.values())
-            .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
-            .map((entry) => {
-                if (entry.clockIn && entry.clockOut) {
-                    const diffMs = entry.clockOut.getTime() - entry.clockIn.getTime();
-                    entry.hours = diffMs / (1000 * 60 * 60);
-                }
-                return entry;
-            });
-
-        return result;
-    };
-
-    // Filter logs based on selected week or date
-    const getFilteredLogs = () => {
-        if (showAllDates) return allDailyLogs;
-
-        if (selectedDate) {
-            // Filter by specific date
-            return allDailyLogs.filter(
-                (log) => log.date === new Date(selectedDate).toLocaleDateString()
-            );
-        }
-
-        // Filter by selected week
-        if (weekOptions.length > 0) {
-            const { start, end } = weekOptions[selectedWeekIndex];
-            return allDailyLogs.filter((log) => {
-                const logDate = new Date(log.date);
-                return logDate >= start && logDate <= end;
-            });
-        }
-
-        return allDailyLogs;
-    };
-
-    // Calculate stats with running total
-    const calculateStats = (logs: DailyLog[]) => {
-        let runningTotal = 0;
-        const logsWithRunning = logs.map((log) => {
-            runningTotal += log.hours;
-            return { ...log, runningTotal };
+        const start = opt.start;
+        const end = opt.end;
+        return allRows.filter((r) => {
+            const d = new Date(`${r.dateISO}T00:00:00`);
+            return d >= start && d <= end;
         });
+    }, [showAllDates, selectedWeekKey, weekOptions, allRows]);
 
-        const total = runningTotal;
-        const reg = total > 40 ? 40 : total;
-        const ot = total > 40 ? total - 40 : 0;
+    /** Per-week REG/OT using rows in view */
+    const weeklyStats = useMemo(() => {
+        const total = filteredRows.reduce((s, r) => s + r.hours, 0);
+        const reg = Math.min(total, 40);
+        const ot = Math.max(0, total - 40);
+        return { reg, ot, total };
+    }, [filteredRows]);
 
-        return { logsWithRunning, reg, ot, total };
+    /** Running Total column (within the week view) */
+    const rowsWithRunningTotal = useMemo(() => {
+        let running = 0;
+        return filteredRows
+            .slice()
+            .reverse()
+            .map((r) => {
+                running += r.hours;
+                return { ...r, runningTotal: running };
+            })
+            .reverse();
+    }, [filteredRows]);
+
+    /** When a date is picked, snap the drop-down to that date’s week */
+    useEffect(() => {
+        if (!selectedDate) return;
+        const [m, d, y] = selectedDate.split("/").map((x) => parseInt(x, 10));
+        const dt = new Date(y, m - 1, d);
+        const s = startOfWeekSun(dt);
+        const e = endOfWeekSat(dt);
+        const key = `${toISO(s)}_${toISO(e)}`;
+        setSelectedWeekKey(key);
+        setShowAllDates(false);
+    }, [selectedDate]);
+
+    /** Edit handlers */
+    const openEdit = (kind: "in" | "out", row: DayRow) => {
+        const existing = kind === "in" ? row.in : row.out;
+        const base = new Date(`${row.dateISO}T00:00:00`);
+        const t = existing ? existing.time.toDate() : base;
+        const hh = pad2(t.getHours());
+        const mm = pad2(t.getMinutes());
+        setModal({
+            open: true,
+            kind,
+            dateISO: row.dateISO,
+            logId: existing?.id,
+            time: `${hh}:${mm}`,
+            note: existing?.managerNote || "",
+        });
     };
 
-    const filteredLogs = getFilteredLogs();
-    const { logsWithRunning: displayLogs, reg, ot, total } = calculateStats(filteredLogs);
-
-    /* ===================== Pay Period Label (ADD-ON) ===================== */
-    const payPeriodLabel = useMemo(() => {
-        if (showAllDates || selectedDate) return "";
-        const wk = weekOptions[selectedWeekIndex];
-        if (!wk) return "";
-        const { periodStart, periodEnd } = biweeklyFromWeekStart(wk.start);
-        return fmtPayRange(periodStart, periodEnd);
-    }, [weekOptions, selectedWeekIndex, showAllDates, selectedDate]);
-    /* ===================================================================== */
-
-    const openEditModal = (log: DailyLog) => {
-        setEditModal({ show: true, log });
-        setEditTime(log.clockOut ? log.clockOut.toTimeString().slice(0, 5) : "17:00");
-        setEditNote(log.note || "");
+    const refreshRows = async (employeeId: string) => {
+        const start = new Date();
+        start.setDate(start.getDate() - 56);
+        const qy = query(
+            collection(db, "logs"),
+            where("employeeId", "==", employeeId),
+            where("time", ">=", Timestamp.fromDate(start)),
+            orderBy("time", "asc")
+        );
+        const snap = await getDocs(qy);
+        const entries = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Log));
+        if (entries[0]?.employeeName) setName(entries[0].employeeName);
+        setAllRows(buildDailyRows(entries));
     };
 
     const saveEdit = async () => {
-        if (!editModal.log?.logId) {
-            alert("Cannot save: No log ID found");
-            return;
-        }
+        if (!modal.open || !modal.dateISO || !modal.time || !employeeId) return;
+        const [H, M] = modal.time.split(":").map(Number);
+        const dt = new Date(`${modal.dateISO}T00:00:00`);
+        dt.setHours(H, M, 0, 0);
 
-        if (!editModal.log.clockOut) {
-            alert(
-                "This employee hasn't clocked out yet. Cannot edit clock-in only entries."
-            );
-            return;
-        }
-
-        try {
-            const logRef = doc(db, "logs", editModal.log.logId);
-            const [hours, minutes] = editTime.split(":").map(Number);
-            const newDate = new Date(editModal.log.date);
-            newDate.setHours(hours, minutes, 0);
-
-            await updateDoc(logRef, {
-                time: Timestamp.fromDate(newDate),
+        if (modal.logId) {
+            await updateDoc(doc(db, "logs", modal.logId), {
+                time: Timestamp.fromDate(dt),
                 edited: true,
-                managerNote: editNote,
-                autoClockOut: false, // Remove auto flag when edited
+                managerNote: modal.note || "",
+                autoClockOut: false,
             });
-
-            alert("Time updated successfully!");
-            window.location.reload();
-        } catch (error) {
-            alert("Failed to update time: " + (error as Error).message);
+        } else {
+            await addDoc(collection(db, "logs"), {
+                employeeId,
+                employeeName: name,
+                type: modal.kind,
+                time: Timestamp.fromDate(dt),
+                edited: true,
+                managerNote: modal.note || "Manual add",
+                autoClockOut: false,
+            });
         }
+
+        await refreshRows(employeeId);
+        setModal({ open: false, kind: "out" });
     };
 
-    const formatTime = (date: Date | null) =>
-        date
-            ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-            : "-";
-
-    if (error && !loading) {
-        return (
-            <main className="min-h-screen bg-[#F3F4F6] flex justify-center items-center p-6">
-                <div className="bg-white shadow-lg rounded-lg p-8 max-w-md text-center">
-                    <h2 className="text-2xl font-bold text-red-600 mb-4">Error</h2>
-                    <p className="text-gray-700 mb-6">{error}</p>
-                    <button
-                        onClick={() => router.push("/admin/dashboard")}
-                        className="bg-[#2563EB] text-white px-6 py-2 rounded-md font-semibold hover:bg-[#1E40AF]"
-                    >
-                        Back to Dashboard
-                    </button>
-                </div>
-            </main>
-        );
-    }
+    /** Right-side card “Pay Period” label (two weeks ending this Sat) */
+    const payPeriodLabel = useMemo(() => {
+        const thisSat = endOfWeekSat(new Date());
+        const start = new Date(thisSat);
+        start.setDate(thisSat.getDate() - 13); // past 14 days
+        return `${fmt(start)} – ${fmt(thisSat)}`;
+    }, []);
 
     return (
         <main className="min-h-screen bg-[#F3F4F6] p-6">
-            <div className="max-w-[1800px] mx-auto">
-                <div className="bg-white shadow-lg rounded-lg p-8 border border-gray-300">
-                    <button
-                        onClick={() => router.push("/admin/dashboard")}
-                        className="text-[#2563EB] font-semibold mb-6 hover:underline flex items-center gap-2 text-lg"
-                    >
-                        ← Back to Dashboard
-                    </button>
+            <div className="max-w-[1200px] mx-auto">
+                <button
+                    onClick={() => router.push("/admin/dashboard")}
+                    className="text-[#2563EB] font-semibold mb-6 hover:underline flex items-center gap-2 text-lg"
+                >
+                    ← Back to Dashboard
+                </button>
 
+                <div className="bg-white shadow-xl rounded-2xl p-8 border border-gray-200">
                     {/* Header */}
-                    <div className="flex flex-col lg:flex-row lg:justify-between lg:items-start mb-6 border-b pb-6 gap-6">
+                    <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-6 mb-6">
                         <div>
-                            <h1 className="text-4xl font-bold text-[#1F2937] mb-2">
-                                {employeeName}'s Timecard
+                            <h1 className="text-3xl font-bold text-[#1F2937] mb-2">
+                                {name}'s Timecard
                             </h1>
-                            <p className="text-lg text-gray-600">
+                            <p className="text-gray-600">
                                 Employee ID:{" "}
-                                <span className="font-semibold text-[#2563EB]">{employeeId}</span>
+                                <span className="font-semibold text-[#2563EB]">
+                                    {employeeId}
+                                </span>
                             </p>
-                            {weekOptions[selectedWeekIndex] && !showAllDates && !selectedDate && (
-                                <div className="mt-3 bg-blue-50 border-l-4 border-blue-500 p-3 rounded">
-                                    <p className="text-base text-gray-700">
-                                        <span className="font-semibold">Viewing:</span>{" "}
-                                        {weekOptions[selectedWeekIndex].label}
-                                    </p>
-                                </div>
-                            )}
-                            {selectedDate && (
-                                <div className="mt-3 bg-green-50 border-l-4 border-green-500 p-3 rounded">
-                                    <p className="text-base text-gray-700">
-                                        <span className="font-semibold">Viewing Date:</span>{" "}
-                                        {new Date(selectedDate).toLocaleDateString()}
-                                    </p>
-                                </div>
-                            )}
-                            {showAllDates && (
-                                <div className="mt-3 bg-gray-100 border-l-4 border-gray-500 p-3 rounded">
-                                    <p className="text-base text-gray-700">
-                                        <span className="font-semibold">Viewing:</span> All Time Records
-                                    </p>
+
+                            {/* Viewing banner */}
+                            {!showAllDates && (
+                                <div className="mt-3 border-l-4 border-[#2563EB] bg-blue-50 text-sm text-[#1F2937] px-3 py-2 rounded">
+                                    Viewing:&nbsp;
+                                    {weekOptions.find((o) => o.key === selectedWeekKey)?.label}
                                 </div>
                             )}
                         </div>
 
-                        {/* Date & Week Filters */}
-                        <div className="flex flex-col gap-4 bg-gray-50 p-5 rounded-lg border-2 border-gray-300 min-w-[350px]">
-                            {/* Pay Period header (ADD-ON) */}
-                            {!showAllDates && !selectedDate && payPeriodLabel && (
-                                <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2">
-                                    <p className="text-sm font-semibold text-blue-800">Pay Period</p>
-                                    <p className="text-base font-medium text-gray-800">{payPeriodLabel}</p>
-                                </div>
-                            )}
-
-                            <div>
-                                <label className="text-sm font-semibold text-gray-700 block mb-2">
-                                    Select Date:
-                                </label>
-                                <input
-                                    type="date"
-                                    value={selectedDate}
-                                    onChange={(e) => {
-                                        setSelectedDate(e.target.value);
-                                        setShowAllDates(false);
-                                    }}
-                                    className="w-full px-4 py-2 border-2 border-gray-300 rounded-md text-base focus:ring-2 focus:ring-blue-500"
-                                />
+                        {/* Right card: Pay period + filters */}
+                        <div className="w-full max-w-sm border rounded-xl p-4 bg-gray-50">
+                            <div className="text-sm font-semibold text-[#1F2937] mb-2">
+                                Pay Period
+                            </div>
+                            <div className="text-sm bg-white border rounded-md px-3 py-2 mb-4">
+                                {payPeriodLabel}
                             </div>
 
-                            <div>
-                                <label className="text-sm font-semibold text-gray-700 block mb-2">
-                                    Select Week:
-                                </label>
-                                <select
-                                    value={selectedWeekIndex}
+                            {/* Date Picker */}
+                            <label className="block mb-3">
+                                <span className="text-sm font-medium">Select Date</span>
+                                <input
+                                    type="text"
+                                    inputMode="none"
+                                    onFocus={(e) => (e.currentTarget.type = "date")}
+                                    onBlur={(e) => (e.currentTarget.type = "text")}
+                                    placeholder="mm/dd/yyyy"
+                                    className="mt-1 w-full border rounded-md px-3 py-2"
                                     onChange={(e) => {
-                                        setSelectedWeekIndex(Number(e.target.value));
-                                        setSelectedDate("");
+                                        const v = e.target.value; // yyyy-mm-dd from date input
+                                        if (!v) {
+                                            setSelectedDate("");
+                                            return;
+                                        }
+                                        const [yy, mm, dd] = v.split("-").map(Number);
+                                        setSelectedDate(`${mm}/${dd}/${yy}`);
+                                    }}
+                                />
+                            </label>
+
+                            {/* Week select */}
+                            <label className="block mb-3">
+                                <span className="text-sm font-medium">Select Week</span>
+                                <select
+                                    className="mt-1 w-full border rounded-md px-3 py-2 bg-white"
+                                    value={selectedWeekKey}
+                                    onChange={(e) => {
+                                        setSelectedWeekKey(e.target.value);
                                         setShowAllDates(false);
                                     }}
-                                    className="w-full px-4 py-2 border-2 border-gray-300 rounded-md text-base font-medium focus:ring-2 focus:ring-blue-500 bg-white"
                                 >
-                                    {weekOptions.map((week, idx) => (
-                                        <option key={idx} value={idx}>
-                                            {week.label}
+                                    {weekOptions.map((o) => (
+                                        <option key={o.key} value={o.key}>
+                                            {o.label}
                                         </option>
                                     ))}
                                 </select>
-                            </div>
+                            </label>
 
                             <button
-                                onClick={() => {
-                                    setShowAllDates(true);
-                                    setSelectedDate("");
-                                }}
-                                className="text-sm text-white bg-[#2563EB] px-4 py-2 rounded-md font-semibold hover:bg-[#1E40AF]"
+                                onClick={() => setShowAllDates(true)}
+                                className="w-full bg-[#2563EB] text-white px-4 py-2 rounded-md font-semibold hover:bg-[#1E40AF]"
                             >
                                 Show All Dates
                             </button>
                         </div>
                     </div>
 
-                    {/* Stats Cards */}
-                    <div className="grid grid-cols-3 gap-6 mb-8">
-                        <div className="text-center bg-green-50 p-6 rounded-lg border-2 border-green-300 shadow-sm hover:shadow-md transition">
-                            <p className="text-sm text-gray-700 font-semibold mb-2">
-                                REGULAR HOURS
+                    {/* Weekly Summary */}
+                    <div className="grid grid-cols-3 gap-4 mb-6">
+                        <div className="text-center bg-green-50 p-4 rounded-lg border-2 border-green-200">
+                            <p className="text-sm text-gray-700 font-semibold mb-1">
+                                REG (this view)
                             </p>
-                            <p className="text-4xl font-bold text-[#059669] mb-1">
-                                {reg.toFixed(2)}
-                            </p>
-                            <p className="text-xs text-gray-600">
-                                {showAllDates
-                                    ? "All Time"
-                                    : selectedDate
-                                        ? "Selected Date"
-                                        : weekOptions[selectedWeekIndex]?.label.split("(")[0]}
+                            <p className="text-3xl font-bold text-[#059669]">
+                                {weeklyStats.reg.toFixed(2)}
                             </p>
                         </div>
-                        <div className="text-center bg-red-50 p-6 rounded-lg border-2 border-red-300 shadow-sm hover:shadow-md transition">
-                            <p className="text-sm text-gray-700 font-semibold mb-2">
-                                OVERTIME HOURS
+                        <div className="text-center bg-red-50 p-4 rounded-lg border-2 border-red-200">
+                            <p className="text-sm text-gray-700 font-semibold mb-1">
+                                OT (this view)
                             </p>
                             <p
-                                className={`text-4xl font-bold mb-1 ${ot > 0 ? "text-red-600" : "text-gray-400"
+                                className={`text-3xl font-bold ${weeklyStats.ot > 0 ? "text-red-600" : "text-gray-400"
                                     }`}
                             >
-                                {ot.toFixed(2)}
-                            </p>
-                            <p className="text-xs text-gray-600">
-                                {ot > 0 ? `${((ot / total) * 100).toFixed(1)}% of total` : "No overtime"}
+                                {weeklyStats.ot.toFixed(2)}
                             </p>
                         </div>
-                        <div className="text-center bg-blue-50 p-6 rounded-lg border-2 border-blue-300 shadow-sm hover:shadow-md transition">
-                            <p className="text-sm text-gray-700 font-semibold mb-2">
-                                TOTAL HOURS
+                        <div className="text-center bg-blue-50 p-4 rounded-lg border-2 border-blue-200">
+                            <p className="text-sm text-gray-700 font-semibold mb-1">
+                                TOTAL (this view)
                             </p>
-                            <p className="text-4xl font-bold text-[#2563EB] mb-1">
-                                {total.toFixed(2)}
-                            </p>
-                            <p className="text-xs text-gray-600">
-                                {displayLogs.length} day{displayLogs.length !== 1 ? "s" : ""} worked
+                            <p className="text-3xl font-bold text-[#2563EB]">
+                                {weeklyStats.total.toFixed(2)}
                             </p>
                         </div>
                     </div>
 
                     {/* Table */}
-                    <div className="overflow-x-auto border-2 border-gray-300 rounded-lg shadow-sm">
+                    <div className="overflow-x-auto border-2 border-gray-200 rounded-lg">
                         <table className="w-full border-collapse">
                             <thead>
                                 <tr className="bg-[#1F2937] text-white">
-                                    <th className="px-6 py-4 text-left text-base font-semibold">Date</th>
-                                    <th className="px-6 py-4 text-left text-base font-semibold">In</th>
-                                    <th className="px-6 py-4 text-left text-base font-semibold">Out</th>
-                                    <th className="px-6 py-4 text-left text-base font-semibold">Daily Hrs</th>
-                                    <th className="px-6 py-4 text-left text-base font-semibold">
-                                        Week Total
-                                        <span className="block text-xs font-normal text-gray-300">Running</span>
-                                    </th>
-                                    <th className="px-6 py-4 text-center text-base font-semibold">Type</th>
-                                    <th className="px-6 py-4 text-center text-base font-semibold">Actions</th>
+                                    <th className="px-6 py-3 text-left">Date</th>
+                                    <th className="px-6 py-3 text-left">In</th>
+                                    <th className="px-6 py-3 text-left">Out</th>
+                                    <th className="px-6 py-3 text-left">Daily Hrs</th>
+                                    <th className="px-6 py-3 text-left">Week Total</th>
+                                    <th className="px-6 py-3 text-center">Type</th>
+                                    <th className="px-6 py-3 text-center">Actions</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 {loading ? (
                                     <tr>
-                                        <td colSpan={7} className="text-center py-12 text-xl text-gray-500">
-                                            Loading timecard data...
+                                        <td colSpan={7} className="text-center py-10 text-gray-500">
+                                            Loading…
                                         </td>
                                     </tr>
-                                ) : displayLogs.length === 0 ? (
+                                ) : rowsWithRunningTotal.length === 0 ? (
                                     <tr>
-                                        <td colSpan={7} className="text-center py-12 text-xl text-gray-500">
-                                            No time records found for this period.
+                                        <td colSpan={7} className="text-center py-10 text-gray-500">
+                                            No records.
                                         </td>
                                     </tr>
                                 ) : (
-                                    displayLogs.map((log, idx) => {
-                                        const isOT = log.runningTotal > 40;
+                                    rowsWithRunningTotal.map((r) => {
+                                        const isOT = r.hours > 8;
                                         return (
-                                            <tr
-                                                key={idx}
-                                                className={`border-t-2 hover:bg-gray-50 transition ${log.hasWarning ? "bg-red-50 border-red-200" : ""
-                                                    }`}
-                                            >
-                                                <td className="px-6 py-4 text-base font-medium">{log.date}</td>
-                                                <td className="px-6 py-4 text-base">{formatTime(log.clockIn)}</td>
-                                                <td className="px-6 py-4">
+                                            <tr key={r.dateISO} className="border-t hover:bg-gray-50">
+                                                <td className="px-6 py-3">{r.displayDate}</td>
+                                                <td className="px-6 py-3">
+                                                    {r.in
+                                                        ? r.in.time!.toDate().toLocaleTimeString([], {
+                                                            hour: "2-digit",
+                                                            minute: "2-digit",
+                                                        })
+                                                        : "-"}
+                                                </td>
+                                                <td className="px-6 py-3">
                                                     <div className="flex items-center gap-2">
-                                                        <span className="text-base">{formatTime(log.clockOut)}</span>
-                                                        {log.hasWarning && (
-                                                            <span className="text-red-600 text-xs font-bold px-3 py-1 bg-red-200 rounded-full border border-red-400 animate-pulse">
-                                                                🚩 AUTO CLOCK-OUT
+                                                        <span>
+                                                            {r.out
+                                                                ? r.out.time!.toDate().toLocaleTimeString([], {
+                                                                    hour: "2-digit",
+                                                                    minute: "2-digit",
+                                                                })
+                                                                : "-"}
+                                                        </span>
+                                                        {r.warning && (
+                                                            <span className="text-red-600 text-xs font-bold px-2 py-1 bg-red-100 rounded">
+                                                                ⚠️ AUTO CLOCK-OUT
                                                             </span>
                                                         )}
                                                     </div>
                                                 </td>
-                                                <td className="px-6 py-4 font-bold text-base">
-                                                    {log.hours.toFixed(2)} hrs
+                                                <td className="px-6 py-3 font-semibold">
+                                                    {r.hours.toFixed(2)} hrs
                                                 </td>
-                                                <td className="px-6 py-4 font-semibold text-base text-gray-700">
-                                                    {log.runningTotal.toFixed(2)} hrs
+                                                <td className="px-6 py-3 font-semibold">
+                                                    {(r as any).runningTotal.toFixed(2)} hrs
                                                 </td>
-                                                <td className="px-6 py-4 text-center">
+                                                <td className="px-6 py-3 text-center">
                                                     <span
-                                                        className={`px-4 py-2 rounded-md text-sm font-bold ${isOT
-                                                            ? "bg-red-100 text-red-700 border-2 border-red-300"
-                                                            : "bg-green-100 text-green-700 border-2 border-green-300"
+                                                        className={`px-3 py-1 rounded-md text-xs font-bold ${isOT
+                                                            ? "bg-red-100 text-red-700"
+                                                            : "bg-green-100 text-green-700"
                                                             }`}
                                                     >
                                                         {isOT ? "OT" : "REG"}
                                                     </span>
                                                 </td>
-                                                <td className="px-6 py-4 text-center">
-                                                    <button
-                                                        onClick={() => openEditModal(log)}
-                                                        className="text-sm bg-[#2563EB] text-white px-4 py-2 rounded-md hover:bg-[#1E40AF] font-semibold transition"
-                                                    >
-                                                        View Notes
-                                                    </button>
+                                                <td className="px-6 py-3">
+                                                    <div className="flex gap-2 justify-center">
+                                                        <button
+                                                            onClick={() => openEdit("in", r)}
+                                                            className="text-sm bg-gray-800 text-white px-3 py-2 rounded-md hover:bg-black"
+                                                        >
+                                                            Edit In
+                                                        </button>
+                                                        <button
+                                                            onClick={() => openEdit("out", r)}
+                                                            className="text-sm bg-[#2563EB] text-white px-3 py-2 rounded-md hover:bg-[#1E40AF]"
+                                                        >
+                                                            Edit Out
+                                                        </button>
+                                                    </div>
                                                 </td>
                                             </tr>
                                         );
@@ -566,63 +589,62 @@ export default function EmployeeDetail() {
             </div>
 
             {/* Edit Modal */}
-            {editModal.show && editModal.log && (
-                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-                    <div className="bg-white rounded-lg p-8 w-full max-w-lg shadow-2xl">
-                        <h3 className="text-2xl font-bold text-[#1F2937] mb-4">
-                            {editModal.log.hasWarning ? "🚩 Review Auto Clock-Out" : "Edit Clock Out Time"}
+            {modal.open && (
+                <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+                    <div className="bg-white rounded-xl p-6 w-full max-w-lg">
+                        <h3 className="text-2xl font-bold mb-3">
+                            {modal.kind === "in" ? "Edit Clock In" : "Edit Clock Out"}
                         </h3>
-                        <p className="text-base text-gray-600 mb-6">
-                            Date: <strong className="text-[#2563EB]">{editModal.log.date}</strong>
+                        <p className="text-sm text-gray-600 mb-4">
+                            Date: <span className="font-semibold">{modal.dateISO}</span>
                         </p>
 
-                        {editModal.log.hasWarning && (
-                            <div className="bg-red-50 border-2 border-red-300 rounded-lg p-4 mb-6">
-                                <p className="text-red-700 font-semibold text-sm">
-                                    ⚠️ This employee was auto-clocked out at 5:00 PM. Please verify or adjust the time.
-                                </p>
-                            </div>
-                        )}
-
-                        <label className="block mb-6">
-                            <span className="text-base font-semibold text-gray-700 mb-2 block">
-                                Clock Out Time
-                            </span>
+                        <label className="block mb-4">
+                            <span className="text-sm font-medium">Time</span>
                             <input
                                 type="time"
-                                value={editTime}
-                                onChange={(e) => setEditTime(e.target.value)}
-                                className="mt-1 block w-full px-4 py-3 text-lg border-2 border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                value={modal.time || ""}
+                                onChange={(e) =>
+                                    setModal((m) => ({ ...m, time: e.target.value }))
+                                }
+                                className="mt-1 w-full border rounded-md px-3 py-2"
                             />
                         </label>
 
                         <label className="block mb-6">
-                            <span className="text-base font-semibold text-gray-700 mb-2 block">
-                                Manager Note
-                            </span>
+                            <span className="text-sm font-medium">Manager Note</span>
                             <textarea
-                                value={editNote}
-                                onChange={(e) => setEditNote(e.target.value)}
-                                rows={4}
-                                placeholder="Add reason for adjustment..."
-                                className="mt-1 block w-full px-4 py-3 text-base border-2 border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                rows={3}
+                                value={modal.note || ""}
+                                onChange={(e) =>
+                                    setModal((m) => ({ ...m, note: e.target.value }))
+                                }
+                                className="mt-1 w-full border rounded-md px-3 py-2"
+                                placeholder="Reason for adjustment"
                             />
                         </label>
 
-                        <div className="flex gap-4">
+                        <div className="flex gap-3">
                             <button
                                 onClick={saveEdit}
-                                className="flex-1 bg-[#059669] text-white px-6 py-3 rounded-md text-lg font-semibold hover:bg-[#047857] transition"
+                                className="flex-1 bg-[#059669] text-white px-4 py-2 rounded-md font-semibold"
                             >
                                 Save Changes
                             </button>
                             <button
-                                onClick={() => setEditModal({ show: false, log: null })}
-                                className="flex-1 bg-gray-300 text-gray-700 px-6 py-3 rounded-md text-lg font-semibold hover:bg-gray-400 transition"
+                                onClick={() => setModal({ open: false, kind: "out" })}
+                                className="flex-1 bg-gray-200 px-4 py-2 rounded-md font-semibold"
                             >
                                 Cancel
                             </button>
                         </div>
+
+                        {!modal.logId && (
+                            <p className="mt-3 text-xs text-gray-500">
+                                No existing {modal.kind === "in" ? "Clock In" : "Clock Out"} for
+                                this date — a new entry will be created.
+                            </p>
+                        )}
                     </div>
                 </div>
             )}
