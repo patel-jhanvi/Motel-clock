@@ -21,6 +21,11 @@ import {
 const ENABLE_ARCHIVE = true;         // copy deletions into logs_archive
 const PAYWEEK_START_DOW = 0;         // 0=Sun (ADP default), 1=Mon, ... 6=Sat
 const WEEKS_TO_SHOW = 30;            // last 30 weeks listed in the dropdown
+const PAY_PERIOD_ANCHOR = new Date(2025, 9, 26); // Oct 26, 2025 (manager’s defined start)
+const PAY_PERIOD_DAYS = 14;
+const PAY_PERIODS_TO_SHOW = 35;
+
+
 
 /** ================= Types ================= */
 type Log = {
@@ -241,9 +246,56 @@ export default function EmployeeDetail() {
         }
         return out;
     }, [thisWeekStart]);
+    const payPeriods = useMemo(() => {
+        const out: {
+            iso: string;
+            start: Date;
+            endExcl: Date;
+            label: string;
+        }[] = [];
 
-    const [selectedWeekISO, setSelectedWeekISO] = useState<string>(weeks[0]?.iso ?? toISO(thisWeekStart));
+        const now = new Date();
+        let anchor = new Date(PAY_PERIOD_ANCHOR);
+
+        // move forward until anchor reaches current date
+        while (anchor.getTime() + PAY_PERIOD_DAYS * 86400000 < now.getTime()) {
+            anchor.setDate(anchor.getDate() + PAY_PERIOD_DAYS);
+        }
+
+        // build backwards list of pay periods
+        for (let i = 0; i < PAY_PERIODS_TO_SHOW; i++) {
+            const start = new Date(anchor);
+            start.setDate(anchor.getDate() - i * PAY_PERIOD_DAYS);
+            const end = new Date(start);
+            end.setDate(start.getDate() + PAY_PERIOD_DAYS - 1);
+            out.push({
+                iso: toISO(start),
+                start,
+                endExcl: new Date(end.getTime() + 86400000),
+                label: `${fmtMDY(start)} – ${fmtMDY(end)}`,
+            });
+        }
+        return out;
+    }, []);
+    // ✅ Automatically select current pay period
+    useEffect(() => {
+        const today = new Date();
+        const current = payPeriods.find(
+            (p) => withinExcl(today, p.start, p.endExcl)
+        );
+        if (current) setSelectedPayISO(current.iso);
+    }, [payPeriods]);
+
+    const [selectedWeekISO, setSelectedWeekISO] = useState<string | null>(
+        weeks[0]?.iso ?? toISO(thisWeekStart)
+    );
+    const [selectedDate, setSelectedDate] = useState<string | null>(null);
+
     const [showAll, setShowAll] = useState(false);
+
+    const [selectedPayISO, setSelectedPayISO] = useState<string | null>(
+        payPeriods[0]?.iso ?? null
+    );
 
     /** ===== employees list once ===== */
     useEffect(() => {
@@ -425,6 +477,15 @@ export default function EmployeeDetail() {
             );
         });
     }, [allRows, showAll, viewMode, selectedWeek, biweeklyRange]);
+    /** ✅ Filter rows for selected pay period **/
+    const rowsForPayPeriod = useMemo(() => {
+        const period = payPeriods.find(p => p.iso === selectedPayISO);
+        if (!period) return allRows;
+        return allRows.filter(r => {
+            const d = new Date(r.dateISO + "T00:00:00");
+            return withinExcl(d, period.start, period.endExcl);
+        });
+    }, [allRows, selectedPayISO, payPeriods]);
 
     /** ===== compute week totals and REG/OT ===== */
     // Map weekStartISO -> total hours in that week
@@ -467,6 +528,46 @@ export default function EmployeeDetail() {
         const header = `${fmtShort(selectedWeek.start)} – ${fmtShort(new Date(w2End.getTime() - 86400000))}`;
         return { reg, ot, total, header };
     }, [showAll, viewMode, selectedWeek, weekTotals]);
+
+    /** ✅ Pay period totals **/
+    /** ✅ Pay period totals (weekly OT logic) **/
+    const payPeriodNumbers = useMemo(() => {
+        const period = payPeriods.find(p => p.iso === selectedPayISO);
+        if (!period) return { reg: 0, ot: 0, total: 0, header: "No Pay Period Selected" };
+
+        // all rows in this pay period
+        const rows = allRows.filter(r => {
+            const d = new Date(r.dateISO + "T00:00:00");
+            return withinExcl(d, period.start, period.endExcl);
+        });
+
+        // group by week start (Sunday)
+        const weeklyMap = new Map<string, number>();
+        for (const r of rows) {
+            const d = new Date(r.dateISO + "T00:00:00");
+            const ws = toISO(startOfWeek(d, 0)); // Sunday start
+            weeklyMap.set(ws, (weeklyMap.get(ws) || 0) + r.hours);
+        }
+
+        let reg = 0;
+        let ot = 0;
+
+        for (const hrs of weeklyMap.values()) {
+            reg += Math.min(40, hrs);
+            ot += Math.max(0, hrs - 40);
+        }
+
+        const total = reg + ot;
+
+        return {
+            reg,
+            ot,
+            total,
+            header: `${fmtShort(period.start)} – ${fmtShort(
+                new Date(period.endExcl.getTime() - 86400000)
+            )}`,
+        };
+    }, [allRows, selectedPayISO, payPeriods]);
 
     /** ===== per-row helpers ===== */
     const weekTotalForRow = (row: DayRow) => {
@@ -682,9 +783,16 @@ export default function EmployeeDetail() {
                             {!showAll && (
                                 <div className="mb-4">
                                     <div className="text-sm px-3 py-2 rounded-md bg-blue-50 text-blue-700 inline-block border border-blue-200">
-                                        Viewing:{" "}
-                                        {viewMode === "weekly" ? "This Week" : "Biweekly"} (
-                                        {weeklyNumbers.header})
+                                        {selectedPayISO
+                                            ? (() => {
+                                                const p = payPeriods.find((x) => x.iso === selectedPayISO);
+                                                if (!p) return "Viewing Pay Period (invalid)";
+                                                return `Viewing Pay Period (${fmtMDY(p.start)} – ${fmtMDY(
+                                                    new Date(p.endExcl.getTime() - 86400000)
+                                                )})`;
+                                            })()
+                                            : `Viewing: ${viewMode === "weekly" ? "This Week" : "Biweekly"
+                                            } (${weeklyNumbers.header})`}
                                     </div>
                                 </div>
                             )}
@@ -697,7 +805,8 @@ export default function EmployeeDetail() {
                                         REG {showAll ? "" : "(this view)"}
                                     </p>
                                     <p className="text-2xl font-bold text-[#059669]">
-                                        {weeklyNumbers.reg.toFixed(2)}
+                                        {(selectedPayISO ? payPeriodNumbers.reg : weeklyNumbers.reg).toFixed(2)}
+
                                     </p>
                                 </div>
                                 <div className="text-center bg-red-50 p-4 rounded-lg border-2 border-red-200">
@@ -708,7 +817,7 @@ export default function EmployeeDetail() {
                                         className={`text-2xl font-bold ${weeklyNumbers.ot > 0 ? "text-red-600" : "text-gray-400"
                                             }`}
                                     >
-                                        {weeklyNumbers.ot.toFixed(2)}
+                                        {(selectedPayISO ? payPeriodNumbers.ot : weeklyNumbers.ot).toFixed(2)}
                                     </p>
                                 </div>
                                 <div className="text-center bg-blue-50 p-4 rounded-lg border-2 border-blue-200">
@@ -716,7 +825,7 @@ export default function EmployeeDetail() {
                                         TOTAL {showAll ? "" : "(this view)"}
                                     </p>
                                     <p className="text-2xl font-bold text-[#2563EB]">
-                                        {weeklyNumbers.total.toFixed(2)}
+                                        {(selectedPayISO ? payPeriodNumbers.total : weeklyNumbers.total).toFixed(2)}
                                     </p>
                                 </div>
                             </div>
@@ -742,14 +851,14 @@ export default function EmployeeDetail() {
                                                     Loading…
                                                 </td>
                                             </tr>
-                                        ) : rowsForView.length === 0 ? (
+                                        ) : (selectedPayISO ? rowsForPayPeriod.length === 0 : rowsForView.length === 0) ? (
                                             <tr>
                                                 <td colSpan={6} className="text-center py-10 text-gray-500">
                                                     No records{showAll ? "" : " in this pay period"}.
                                                 </td>
                                             </tr>
                                         ) : (
-                                            rowsForView.map((r, idx) => {
+                                            (selectedPayISO ? rowsForPayPeriod : rowsForView).map((r, idx) => {
                                                 const hasNote = !!(r.in?.managerNote || r.out?.managerNote);
                                                 return (
 
@@ -839,40 +948,52 @@ export default function EmployeeDetail() {
                             <div className="rounded-xl border border-gray-200 p-5 bg-gray-50">
                                 <h3 className="text-lg font-semibold mb-4">Pay Period</h3>
 
-                                {/* Pay period display */}
-                                <input
-                                    readOnly
-                                    value={
-                                        showAll
-                                            ? "All Dates (Last 30 Weeks)"
-                                            : viewMode === "weekly"
-                                                ? `${fmtMDY(selectedWeek.start)} – ${fmtMDY(new Date(selectedWeek.endExcl.getTime() - 86400000))}`
-                                                : `${fmtMDY(selectedWeek.start)} – ${fmtMDY(new Date(endOfWeekExcl(new Date(selectedWeek.start.getTime() + 14 * 86400000)).getTime() - 86400000))}`
-                                    }
-                                    className="w-full border rounded-md px-3 py-2 mb-4 bg-white"
-                                />
+
 
                                 {/* Select Date */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-600 mb-1">
+                                        Select Date
+                                    </label>
+                                    <input
+                                        type="date"  // 👈 this gives you a native calendar picker
+                                        value={selectedDate ?? ""}
+                                        onChange={(e) => setSelectedDate(e.target.value)}
+                                        className="w-full border border-gray-300 rounded-md px-3 py-2 cursor-pointer bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    />
+                                </div>
+                                {/* ✅ Select Pay Period dropdown */}
                                 <label className="block text-sm font-medium text-gray-700 mb-1">
-                                    Select Date
+                                    Select Pay Period
                                 </label>
-                                <input
-                                    type="text"
-                                    placeholder="mm/dd/yyyy"
-                                    value={datePicker}
-                                    onChange={(e) => onPickDate(e.target.value)}
+                                <select
+                                    value={selectedPayISO ?? ""}
+                                    onChange={(e) => {
+                                        setSelectedPayISO(e.target.value);
+                                        setSelectedWeekISO(null);
+                                        setShowAll(false);
+                                    }}
                                     className="w-full border rounded-md px-3 py-2 mb-4 bg-white"
-                                />
-
+                                >
+                                    {payPeriods.map((p, idx) => (
+                                        <option key={p.iso} value={p.iso}>
+                                            {`Pay Period ${idx + 1}: ${p.label}`}
+                                        </option>
+                                    ))}
+                                </select>
                                 {/* Select Week dropdown */}
                                 <label className="block text-sm font-medium text-gray-700 mb-1">
                                     Select Week
                                 </label>
                                 <select
-                                    value={selectedWeekISO}
+                                    value={selectedWeekISO ?? ""}
                                     onChange={(e) => {
+
                                         setSelectedWeekISO(e.target.value);
+                                        setSelectedPayISO(null);  // 👈 clear pay period
                                         setShowAll(false);
+
+
                                     }}
                                     className="w-full border rounded-md px-3 py-2 mb-4 bg-white"
                                 >
