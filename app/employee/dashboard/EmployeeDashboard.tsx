@@ -56,9 +56,14 @@ export default function EmployeeDashboard() {
     }, [empId, router]);
 
     const fetchLastStatus = async (empId: string) => {
+        // ✅ FIX: Only check logs from last 48 hours
+        const twoDaysAgo = new Date();
+        twoDaysAgo.setHours(twoDaysAgo.getHours() - 48);
+
         const q = query(
             collection(db, "logs"),
             where("employeeId", "==", empId),
+            where("time", ">=", twoDaysAgo), // ✅ ADDED THIS LINE
             orderBy("time", "desc"),
             limit(1)
         );
@@ -68,29 +73,38 @@ export default function EmployeeDashboard() {
             const lastLog = snapshot.docs[0].data();
             setStatus(lastLog.type);
         } else {
-            setStatus(null);
+            setStatus(null); // No recent logs = can clock in
         }
     };
 
     const handleAction = async (type: "in" | "out") => {
         if (!empId) return;
 
-        await addDoc(collection(db, "logs"), {
-            employeeId: empId,
-            employeeName,
-            role,
-            type,
-            time: serverTimestamp(),
-        });
+        try {
+            // ✅ Create the log entry
+            await addDoc(collection(db, "logs"), {
+                employeeId: empId,
+                employeeName,
+                role,
+                type,
+                time: serverTimestamp(),
+                autoClockOut: false, // ✅ Added this field
+            });
 
-        const actionTime = new Date().toLocaleTimeString();
-        setStatus(type);
-        setMessage(`You clocked ${type === "in" ? "in" : "out"} at ${actionTime}`);
+            const actionTime = new Date().toLocaleTimeString();
+            setStatus(type);
+            setMessage(`✅ You clocked ${type === "in" ? "in" : "out"} at ${actionTime}`);
 
-        // Return to login screen after 4 seconds
-        setTimeout(() => {
-            router.push("/login");
-        }, 4000);
+            console.log(`✅ ${employeeName} clocked ${type} successfully`); // ✅ Added logging
+
+            // Return to login screen after 4 seconds
+            setTimeout(() => {
+                router.push("/login");
+            }, 4000);
+        } catch (error) {
+            console.error("❌ Error clocking " + type + ":", error);
+            setMessage("❌ Error. Please try again or contact your manager.");
+        }
     };
 
     return (

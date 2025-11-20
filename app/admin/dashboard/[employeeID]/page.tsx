@@ -2,20 +2,26 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { db } from "@/lib/firebase";
+
 import ReactDOM from "react-dom";
-import {
-    collection,
-    getDocs,
-    query,
-    where,
-    doc,
-    updateDoc,
-    addDoc,
-    deleteDoc,
-    Timestamp,
-    setDoc,
-} from "firebase/firestore";
+
+import { db } from "@/lib/firebase";
+import * as firestore from "firebase/firestore";
+
+const collection = firestore.collection;
+const query = firestore.query;
+const where = firestore.where;
+const orderBy = firestore.orderBy;
+const limit = firestore.limit;
+const getDocs = firestore.getDocs;
+const addDoc = firestore.addDoc;
+const updateDoc = firestore.updateDoc;
+const deleteDoc = firestore.deleteDoc;
+const doc = firestore.doc;
+const Timestamp = firestore.Timestamp;
+const setDoc = firestore.setDoc;
+
+
 
 /** ================= Config ================= */
 const ENABLE_ARCHIVE = true;         // copy deletions into logs_archive
@@ -73,6 +79,32 @@ const fmtMDY = (d: Date) =>
 const fmtShort = (d: Date) =>
     d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 const withinExcl = (d: Date, start: Date, endExcl: Date) => d >= start && d < endExcl;
+// ✅ Improved calcTotals that handles weekly OT even in pay period
+function calcTotals(rows: DayRow[], mode: "week" | "payperiod") {
+    if (!rows || rows.length === 0) return { reg: 0, ot: 0, total: 0 };
+
+    // Group rows by week start (Sunday)
+    const byWeek = new Map<string, number>();
+    for (const r of rows) {
+        if (!r.in || !r.out || !r.hours) continue;
+        const d = new Date(r.dateISO + "T00:00:00");
+        const weekKey = toISO(startOfWeek(d));
+        byWeek.set(weekKey, (byWeek.get(weekKey) || 0) + r.hours);
+    }
+
+    // Now compute REG and OT per week (each week capped at 40)
+    let reg = 0, ot = 0;
+    for (const [, hrs] of byWeek) {
+        if (hrs > 40) {
+            reg += 40;
+            ot += hrs - 40;
+        } else {
+            reg += hrs;
+        }
+    }
+
+    return { reg, ot, total: reg + ot };
+}
 
 /** ================= Small UI piece ================= */
 
@@ -149,8 +181,7 @@ function ActionsMenu({
                         setOpen(false);
                         onEditIn();
                     }}
-                    disabled={!row.in}
-                    className="w-full text-left px-3 py-2 text-sm hover:bg-gray-50 disabled:opacity-40"
+                    className="w-full text-left px-3 py-2 text-sm hover:bg-gray-50"
                 >
                     Edit In
                 </button>
@@ -159,32 +190,13 @@ function ActionsMenu({
                         setOpen(false);
                         onEditOut();
                     }}
-                    disabled={!row.out}
-                    className="w-full text-left px-3 py-2 text-sm hover:bg-gray-50 disabled:opacity-40"
+                    className="w-full text-left px-3 py-2 text-sm hover:bg-gray-50"
                 >
                     Edit Out
                 </button>
+
                 <div className="my-1 h-px bg-gray-200" />
-                <button
-                    onClick={() => {
-                        setOpen(false);
-                        onDeleteIn();
-                    }}
-                    disabled={!row.in}
-                    className="w-full text-left px-3 py-2 text-sm hover:bg-red-50 text-red-600 disabled:opacity-40"
-                >
-                    Delete In
-                </button>
-                <button
-                    onClick={() => {
-                        setOpen(false);
-                        onDeleteOut();
-                    }}
-                    disabled={!row.out}
-                    className="w-full text-left px-3 py-2 text-sm hover:bg-red-50 text-red-600 disabled:opacity-40"
-                >
-                    Delete Out
-                </button>
+
                 <button
                     onClick={() => {
                         setOpen(false);
@@ -234,18 +246,8 @@ export default function EmployeeDetail() {
     const thisWeekStart = startOfWeek(now);
 
     // build week options (last 30 weeks)
-    const weeks = useMemo(() => {
-        const out: { iso: string; start: Date; endExcl: Date; label: string; header: string }[] = [];
-        for (let i = 0; i < WEEKS_TO_SHOW; i++) {
-            const s = new Date(thisWeekStart);
-            s.setDate(s.getDate() - i * 7);
-            const e = endOfWeekExcl(s);
-            const label = `This Week (${fmtMDY(s)} - ${fmtMDY(new Date(e.getTime() - 86400000))})`;
-            const header = `${fmtShort(s)} – ${fmtShort(new Date(e.getTime() - 86400000))}`;
-            out.push({ iso: toISO(s), start: s, endExcl: e, label, header });
-        }
-        return out;
-    }, [thisWeekStart]);
+
+
     const payPeriods = useMemo(() => {
         const out: {
             iso: string;
@@ -253,6 +255,7 @@ export default function EmployeeDetail() {
             endExcl: Date;
             label: string;
         }[] = [];
+
 
         const now = new Date();
         let anchor = new Date(PAY_PERIOD_ANCHOR);
@@ -277,6 +280,37 @@ export default function EmployeeDetail() {
         }
         return out;
     }, []);
+    // ✅ Build week list with pay period linkage
+    const weeks = useMemo(() => {
+        const out: {
+            iso: string;
+            start: Date;
+            endExcl: Date;
+            label: string;
+            header: string;
+            periodIso: string;
+        }[] = [];
+
+        for (const period of payPeriods) {
+            let cur = new Date(period.start);
+            while (cur < period.endExcl) {
+                const s = startOfWeek(cur);
+                const e = endOfWeekExcl(s);
+                if (s >= period.start && s < period.endExcl) {
+                    out.push({
+                        iso: toISO(s),
+                        start: s,
+                        endExcl: e,
+                        label: `${fmtMDY(s)} - ${fmtMDY(new Date(e.getTime() - 86400000))}`,
+                        header: `${fmtShort(s)} – ${fmtShort(new Date(e.getTime() - 86400000))}`,
+                        periodIso: period.iso,
+                    });
+                }
+                cur.setDate(cur.getDate() + 7);
+            }
+        }
+        return out.sort((a, b) => b.start.getTime() - a.start.getTime());
+    }, [payPeriods]);
     // ✅ Automatically select current pay period
     useEffect(() => {
         const today = new Date();
@@ -298,14 +332,30 @@ export default function EmployeeDetail() {
     );
 
     /** ===== employees list once ===== */
+
     useEffect(() => {
         (async () => {
-            const snap = await getDocs(collection(db, "logs"));
             const uniq = new Map<string, { employeeId: string; name: string }>();
-            snap.docs.forEach((d) => {
+
+            // Get employees from logs
+            const logsSnap = await getDocs(collection(db, "logs"));
+            logsSnap.docs.forEach((d) => {
                 const x = d.data() as any;
-                if (x.employeeId && x.employeeName) uniq.set(x.employeeId, { employeeId: x.employeeId, name: x.employeeName });
+                if (x.employeeId && x.employeeName) {
+                    uniq.set(x.employeeId, { employeeId: x.employeeId, name: x.employeeName });
+                }
             });
+
+            // Also get employees from employees collection (includes new ones with 0 logs)
+            const empSnap = await getDocs(collection(db, "employees"));
+            empSnap.docs.forEach((d) => {
+                const emp = d.data() as any;
+                if (emp.employeeId && emp.name) {
+                    // Only add if not already in map, or update if it is
+                    uniq.set(emp.employeeId, { employeeId: emp.employeeId, name: emp.name });
+                }
+            });
+
             setEmployees([...uniq.values()].sort((a, b) => a.name.localeCompare(b.name)));
         })();
     }, []);
@@ -329,16 +379,55 @@ export default function EmployeeDetail() {
         );
         const snap = await getDocs(qy);
         const entries = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Log));
-        entries.sort((a, b) => tsToDate(a.time).getTime() - tsToDate(b.time).getTime());
+        entries.sort((a, b) => tsToDate(b.time).getTime() - tsToDate(a.time).getTime());
 
-        if (entries[0]?.employeeName) setName(entries[0].employeeName);
-        else setName("Unknown Employee");
+
+        // Try to get name from logs first, then from employees collection
+        if (entries[0]?.employeeName) {
+            setName(entries[0].employeeName);
+        } else {
+            // Fetch from employees collection if no logs exist yet
+            try {
+                const empQuery = query(
+                    collection(db, "employees"),
+                    where("employeeId", "==", empId)
+                );
+                const empSnap = await getDocs(empQuery);
+                if (!empSnap.empty) {
+                    const empData = empSnap.docs[0].data();
+                    setName(empData.name || empData.employeeName || "Unknown Employee");
+                } else {
+                    setName("Unknown Employee");
+                }
+            } catch (err) {
+                console.error("Error fetching employee name:", err);
+                setName("Unknown Employee");
+            }
+        }
 
         // group by date & pair
         const groups = new Map<string, Log[]>();
+
         for (const lg of entries) {
             const d = tsToDate(lg.time);
-            const key = toISO(d);
+            let key = toISO(d);
+
+            // Night shift logic: treat 11 PM - 6 AM as belonging to the shift start date
+            if (lg.type === "in" && d.getHours() >= 23) {
+                // Clock-in at 11 PM or later stays on its current date (shift start)
+                key = toISO(d);
+            } else if (lg.type === "out" && d.getHours() < 6) {
+                // Clock-out before 6 AM moves to previous day (to match the shift start)
+                const prev = new Date(d);
+                prev.setDate(prev.getDate() - 1);
+                key = toISO(prev);
+            } else if (lg.type === "in" && d.getHours() < 6) {
+                // Clock-in before 6 AM also moves to previous day (late arrival to night shift)
+                const prev = new Date(d);
+                prev.setDate(prev.getDate() - 1);
+                key = toISO(prev);
+            }
+
             if (!groups.has(key)) groups.set(key, []);
             groups.get(key)!.push(lg);
         }
@@ -346,33 +435,71 @@ export default function EmployeeDetail() {
         const rows: DayRow[] = [];
         for (const [dateISO, list] of groups) {
             list.sort((a, b) => tsToDate(a.time).getTime() - tsToDate(b.time).getTime());
+
             const ins: Log[] = [];
             const outs: Log[] = [];
             list.forEach((lg) => (lg.type === "in" ? ins.push(lg) : outs.push(lg)));
+
             const usedOut = new Set<string>();
+            const usedIn = new Set<string>();
+
             for (const IN of ins) {
-                const inMs = tsToDate(IN.time).getTime();
-                const OUT = outs.find((o) => !usedOut.has(o.id) && tsToDate(o.time).getTime() >= inMs);
-                if (OUT) {
-                    usedOut.add(OUT.id);
+                const inTime = tsToDate(IN.time);
+                const inMs = inTime.getTime();
+
+                // Find the OUT that comes after this IN
+                let bestOut: Log | null = null;
+                let bestOutMs = Infinity;
+
+                for (const OUT of outs) {
+                    if (usedOut.has(OUT.id)) continue;
+
+                    const outTime = tsToDate(OUT.time);
+                    let outMs = outTime.getTime();
+
+                    // If OUT time is before IN time, add 24 hours (overnight shift)
+                    if (outMs < inMs) {
+                        outMs += 24 * 60 * 60 * 1000;
+                    }
+
+                    // Is this OUT after IN and closer than previous matches?
+                    if (outMs >= inMs && outMs < bestOutMs) {
+                        bestOut = OUT;
+                        bestOutMs = outMs;
+                    }
+                }
+
+                if (bestOut) {
+                    usedOut.add(bestOut.id);
+                    usedIn.add(IN.id);
+
+                    // Calculate hours with overnight handling
+                    let outTimeMs = tsToDate(bestOut.time).getTime();
+                    if (outTimeMs < inMs) {
+                        outTimeMs += 24 * 60 * 60 * 1000;
+                    }
+
                     rows.push({
                         dateISO,
-                        displayDate: tsToDate(IN.time).toLocaleDateString(),
+                        displayDate: inTime.toLocaleDateString(),
                         in: IN,
-                        out: OUT,
-                        hours: msToHours(tsToDate(OUT.time).getTime() - inMs),
-                        warning: !!OUT.autoClockOut,
+                        out: bestOut,
+                        hours: msToHours(outTimeMs - inMs),
+                        warning: !!bestOut.autoClockOut,
                     });
                 } else {
+                    usedIn.add(IN.id);
                     rows.push({
                         dateISO,
-                        displayDate: tsToDate(IN.time).toLocaleDateString(),
+                        displayDate: inTime.toLocaleDateString(),
                         in: IN,
                         hours: 0,
                         warning: false,
                     });
                 }
             }
+
+            // Orphaned OUTs
             outs.forEach((O) => {
                 if (!usedOut.has(O.id)) {
                     rows.push({
@@ -385,11 +512,9 @@ export default function EmployeeDetail() {
                 }
             });
         }
-        rows.sort((a, b) => (a.dateISO < b.dateISO ? 1 : -1));
         setAllRows(rows);
         setLoading(false);
     };
-
     useEffect(() => {
         fetchRows(currentEmployeeId);
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -415,7 +540,20 @@ export default function EmployeeDetail() {
             const s = r.in ? tsToDate(r.in.time) : null;
             const e = r.out ? tsToDate(r.out.time) : null;
             if (!s || !e) continue;
-            if (start < e && end > s) return true;
+
+            // Handle night shifts: if end time is before start time, add 24 hours
+            let adjustedEnd = new Date(e);
+            if (e <= s) {
+                adjustedEnd = new Date(e.getTime() + 24 * 60 * 60 * 1000);
+            }
+
+            // Similarly adjust the time range being checked
+            let checkEnd = new Date(end);
+            if (end <= start) {
+                checkEnd = new Date(end.getTime() + 24 * 60 * 60 * 1000);
+            }
+
+            if (start < adjustedEnd && checkEnd > s) return true;
         }
         return false;
     };
@@ -489,91 +627,62 @@ export default function EmployeeDetail() {
 
     /** ===== compute week totals and REG/OT ===== */
     // Map weekStartISO -> total hours in that week
+    // ✅ Cumulative week totals reset per pay period or week
     const weekTotals = useMemo(() => {
         const map = new Map<string, number>();
-        for (const r of allRows) {
-            const d = new Date(r.dateISO + "T00:00:00");
-            const ws = startOfWeek(d);
-            const key = toISO(ws);
-            map.set(key, (map.get(key) || 0) + r.hours);
+        const activeRows = selectedPayISO ? rowsForPayPeriod : rowsForView;
+
+        // Sort ascending (oldest first) so we can accumulate
+        const sorted = [...activeRows].sort(
+            (a, b) => new Date(a.dateISO).getTime() - new Date(b.dateISO).getTime()
+        );
+
+        let running = 0;
+        for (const r of sorted) {
+            if (!r.in || !r.out || r.hours <= 0) continue;
+
+            running += r.hours;
+            map.set(r.dateISO, running);
         }
         return map;
-    }, [allRows]);
+    }, [rowsForView, rowsForPayPeriod, selectedPayISO]);
 
-    const weeklyNumbers = useMemo(() => {
-        if (showAll) {
-            // in "All Dates", cards show 0.00 to avoid confusion
-            return { reg: 0, ot: 0, total: 0, header: "All Dates" };
+
+
+    // ✅ Compute totals dynamically based on week or pay period
+    const totals = useMemo(() => {
+        if (showAll) return calcTotals(allRows, "payperiod"); // treat as biweekly view
+
+        if (selectedPayISO) {
+            const selectedPayPeriod = payPeriods.find(p => p.iso === selectedPayISO);
+            if (!selectedPayPeriod) return { reg: 0, ot: 0, total: 0 };
+
+            const filtered = allRows.filter(r => {
+                const d = new Date(r.dateISO + "T00:00:00");
+                return d >= selectedPayPeriod.start && d < selectedPayPeriod.endExcl;
+            });
+            return calcTotals(filtered, "payperiod");
         }
 
-        if (viewMode === "weekly") {
-            const wkKey = selectedWeek.iso;
-            const total = weekTotals.get(wkKey) || 0;
-            const reg = Math.min(40, total);
-            const ot = Math.max(0, total - 40);
-            return { reg, ot, total, header: `${fmtShort(selectedWeek.start)} – ${fmtShort(new Date(selectedWeek.endExcl.getTime() - 86400000))}` };
+        if (selectedWeekISO) {
+            const selectedWeek = weeks.find(w => w.iso === selectedWeekISO);
+            if (!selectedWeek) return { reg: 0, ot: 0, total: 0 };
+
+            const filtered = allRows.filter(r => {
+                const d = new Date(r.dateISO + "T00:00:00");
+                return d >= selectedWeek.start && d < selectedWeek.endExcl;
+            });
+            return calcTotals(filtered, "week");
         }
 
-        // biweekly: sum two adjacent weeks, but OT is calculated per week and then summed
-        const w1Key = selectedWeek.iso;
-        const w2Key = toISO(new Date(selectedWeek.start.getTime() + 7 * 86400000));
-        const t1 = weekTotals.get(w1Key) || 0;
-        const t2 = weekTotals.get(w2Key) || 0;
+        return { reg: 0, ot: 0, total: 0 };
+    }, [showAll, selectedPayISO, selectedWeekISO, allRows, weeks, payPeriods]);
 
-        const reg = Math.min(40, t1) + Math.min(40, t2);
-        const ot = Math.max(0, t1 - 40) + Math.max(0, t2 - 40);
-        const total = t1 + t2;
 
-        const w2End = endOfWeekExcl(new Date(selectedWeek.start.getTime() + 7 * 86400000));
-        const header = `${fmtShort(selectedWeek.start)} – ${fmtShort(new Date(w2End.getTime() - 86400000))}`;
-        return { reg, ot, total, header };
-    }, [showAll, viewMode, selectedWeek, weekTotals]);
-
-    /** ✅ Pay period totals **/
-    /** ✅ Pay period totals (weekly OT logic) **/
-    const payPeriodNumbers = useMemo(() => {
-        const period = payPeriods.find(p => p.iso === selectedPayISO);
-        if (!period) return { reg: 0, ot: 0, total: 0, header: "No Pay Period Selected" };
-
-        // all rows in this pay period
-        const rows = allRows.filter(r => {
-            const d = new Date(r.dateISO + "T00:00:00");
-            return withinExcl(d, period.start, period.endExcl);
-        });
-
-        // group by week start (Sunday)
-        const weeklyMap = new Map<string, number>();
-        for (const r of rows) {
-            const d = new Date(r.dateISO + "T00:00:00");
-            const ws = toISO(startOfWeek(d, 0)); // Sunday start
-            weeklyMap.set(ws, (weeklyMap.get(ws) || 0) + r.hours);
-        }
-
-        let reg = 0;
-        let ot = 0;
-
-        for (const hrs of weeklyMap.values()) {
-            reg += Math.min(40, hrs);
-            ot += Math.max(0, hrs - 40);
-        }
-
-        const total = reg + ot;
-
-        return {
-            reg,
-            ot,
-            total,
-            header: `${fmtShort(period.start)} – ${fmtShort(
-                new Date(period.endExcl.getTime() - 86400000)
-            )}`,
-        };
-    }, [allRows, selectedPayISO, payPeriods]);
 
     /** ===== per-row helpers ===== */
     const weekTotalForRow = (row: DayRow) => {
-        const d = new Date(row.dateISO + "T00:00:00");
-        const key = toISO(startOfWeek(d));
-        return weekTotals.get(key) || 0;
+        return weekTotals.get(row.dateISO) || 0;
     };
 
     /** ===== add/edit/delete ===== */
@@ -600,22 +709,48 @@ export default function EmployeeDetail() {
         setQuickAdd({ open: false });
         await fetchRows(currentEmployeeId);
     };
-
     const saveManualAdd = async () => {
         if (!manualAdd.date || !manualAdd.inTime || !manualAdd.outTime) return;
+
         const [y, m, d] = manualAdd.date.split("-").map(Number);
         const [inH, inM] = (manualAdd.inTime || "09:00").split(":").map(Number);
         const [outH, outM] = (manualAdd.outTime || "17:00").split(":").map(Number);
+
         const inDt = new Date(y, m - 1, d, inH, inM, 0, 0);
-        const outDt = new Date(y, m - 1, d, outH, outM, 0, 0);
-        const note = (manualAdd.note || "Backfilled").trim();
-        if (outDt <= inDt) { alert("Clock out must be after clock in."); return; }
-        if (hasOverlap(toISO(inDt), inDt, outDt)) { alert("This pair overlaps another interval for this day."); return; }
-        await addDoc(collection(db, "logs"), { employeeId: currentEmployeeId, employeeName: name, type: "in", time: Timestamp.fromDate(inDt), edited: true, managerNote: note, autoClockOut: false });
-        await addDoc(collection(db, "logs"), { employeeId: currentEmployeeId, employeeName: name, type: "out", time: Timestamp.fromDate(outDt), edited: true, managerNote: note, autoClockOut: false });
+        let outDt = new Date(y, m - 1, d, outH, outM, 0, 0);
+
+        // ✅ Handle overnight shifts: if out time <= in time, it's next day
+        if (outDt <= inDt || outH < inH || (outH === inH && outM <= inM)) {
+            outDt.setDate(outDt.getDate() + 1);
+        }
+
+        const note = (manualAdd.note || "Manual entry").trim();
+
+        // ✅ No overlap check for now - just create the entries
+        await addDoc(collection(db, "logs"), {
+            employeeId: currentEmployeeId,
+            employeeName: name,
+            type: "in",
+            time: Timestamp.fromDate(inDt),
+            edited: true,
+            managerNote: note,
+            autoClockOut: false
+        });
+
+        await addDoc(collection(db, "logs"), {
+            employeeId: currentEmployeeId,
+            employeeName: name,
+            type: "out",
+            time: Timestamp.fromDate(outDt),
+            edited: true,
+            managerNote: note,
+            autoClockOut: false
+        });
+
         setManualAdd({ open: false });
         await fetchRows(currentEmployeeId);
     };
+
 
     const saveEditHours = async () => {
         if (!editHours.row || !editHours.hours) return;
@@ -641,6 +776,7 @@ export default function EmployeeDetail() {
         await fetchRows(currentEmployeeId);
     };
 
+    // === Edit modal open ===
     const openEditTs = (kind: "in" | "out", row: DayRow) => {
         const ref = kind === "in" ? row.in : row.out;
         const base = ref ? tsToDate(ref.time) : new Date(`${row.dateISO}T00:00:00`);
@@ -649,42 +785,60 @@ export default function EmployeeDetail() {
         setEditTs({ open: true, kind, row, time: `${hh}:${mm}`, note: ref?.managerNote || "" });
     };
 
+    // === Save edit timestamp ===
+    // === Save edit timestamp ===
     const saveEditTs = async () => {
         if (!editTs.open || !editTs.row || !editTs.time) return;
+
         const [H, M] = editTs.time.split(":").map(Number);
         const [y, m, d] = editTs.row.dateISO.split("-").map(Number);
-        const when = new Date(y, m - 1, d, H, M, 0, 0);
+        let when = new Date(y, m - 1, d, H, M, 0, 0);
+
+        // ✅ Handle night-shift timestamps
+        if (editTs.kind === "out" && H < 6) {
+            // Clock-out before 6 AM → belongs to next day
+            when.setDate(when.getDate() + 1);
+        }
+        // NOTE: Clock-in at/after 11 PM stays on the dateISO (which is already the shift start date)
+        // No adjustment needed because the grouping logic already put it on the right date
+
         const note = (editTs.note || "Timestamp adjusted").trim();
         const target = editTs.kind === "in" ? editTs.row.in : editTs.row.out;
 
-        const ignore: string[] = [];
-        if (editTs.row.in?.id) ignore.push(editTs.row.in.id);
-        if (editTs.row.out?.id) ignore.push(editTs.row.out.id);
-
-        const partner = editTs.kind === "in" ? editTs.row.out : editTs.row.in;
-        if (partner) {
-            const s = editTs.kind === "in" ? when : tsToDate(partner.time);
-            const e = editTs.kind === "in" ? tsToDate(partner.time) : when;
-            if (e <= s) { alert("Clock out must be after clock in."); return; }
-            if (hasOverlap(editTs.row.dateISO, s, e, ignore)) {
-                alert("This edit creates an overlap with another interval.");
-                return;
+        try {
+            if (target && target.id) {
+                // ✅ Update existing log
+                console.log("✅ Updating existing log:", target.id, "to", when.toString());
+                await updateDoc(doc(db, "logs", target.id), {
+                    time: Timestamp.fromDate(when),
+                    edited: true,
+                    managerNote: note,
+                    autoClockOut: false,
+                });
+            } else {
+                // ✅ Create new log
+                console.log("✅ Creating new log:", editTs.kind, "at", when.toString());
+                await addDoc(collection(db, "logs"), {
+                    employeeId: currentEmployeeId,
+                    employeeName: name,
+                    type: editTs.kind,
+                    time: Timestamp.fromDate(when),
+                    edited: true,
+                    managerNote: note,
+                    autoClockOut: false,
+                });
             }
-        }
 
-        if (target) {
-            await updateDoc(doc(db, "logs", target.id), {
-                time: Timestamp.fromDate(when), edited: true, managerNote: note, autoClockOut: false,
-            });
-        } else {
-            await addDoc(collection(db, "logs"), {
-                employeeId: currentEmployeeId, employeeName: name, type: editTs.kind,
-                time: Timestamp.fromDate(when), edited: true, managerNote: note, autoClockOut: false,
-            });
+            setEditTs({ open: false, kind: "in" });
+            await fetchRows(currentEmployeeId);
+        } catch (err) {
+            console.error("❌ Error saving edit:", err);
+            alert("Error: " + (err as Error).message);
         }
-        setEditTs({ open: false, kind: "in" });
-        await fetchRows(currentEmployeeId);
     };
+
+
+
 
     const deleteSingle = async (which: "in" | "out", row: DayRow) => {
         const log = which === "in" ? row.in : row.out;
@@ -703,30 +857,101 @@ export default function EmployeeDetail() {
     };
 
     /** ===== export (respect current view) ===== */
-    const exportCSV = () => {
-        const header = ["Date", "In", "Out", "Daily Hrs", "Week Total", "Note"];
-        const lines = [header.join(",")];
-        rowsForView.forEach((r) => {
-            const inStr = r.in
-                ? tsToDate(r.in.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-                : "";
-            const outStr = r.out
-                ? tsToDate(r.out.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-                : r.in ? "Still clocked in" : "";
-            const weekTot = weekTotalForRow(r).toFixed(2);
-            const note = (r.out?.managerNote || r.in?.managerNote || "").replace(/,/g, " ");
-            lines.push([r.displayDate, inStr, outStr, r.hours.toFixed(2), weekTot, note].join(","));
+    const exportCSV = async () => {
+        // Fetch holidays
+        const holidaysSnap = await getDocs(collection(db, "holidays"));
+        const holidays = new Map<string, string>();
+        holidaysSnap.docs.forEach((d) => {
+            const data = d.data();
+            if (data.isPaid) {
+                holidays.set(data.date, data.name);
+            }
         });
+
+        // Get the rows to export
+        const rows = selectedPayISO ? rowsForPayPeriod : rowsForView;
+
+        // Calculate totals
+        const { reg, ot, total } = totals;
+
+        // Count holiday hours
+        let holidayHours = 0;
+        rows.forEach((r) => {
+            if (holidays.has(r.dateISO) && r.hours > 0) {
+                holidayHours += r.hours;
+            }
+        });
+
+        // Get pay period info for header
+        let periodLabel = "";
+        if (selectedPayISO) {
+            const period = payPeriods.find((p) => p.iso === selectedPayISO);
+            if (period) {
+                periodLabel = `${fmtMDY(period.start)} - ${fmtMDY(new Date(period.endExcl.getTime() - 86400000))}`;
+            }
+        } else if (selectedWeekISO) {
+            const week = weeks.find((w) => w.iso === selectedWeekISO);
+            if (week) {
+                periodLabel = `${fmtMDY(week.start)} - ${fmtMDY(new Date(week.endExcl.getTime() - 86400000))}`;
+            }
+        }
+
+        const lines: string[] = [];
+
+        // Title section
+        lines.push("EMPLOYEE TIMECARD");
+        lines.push("");
+        lines.push(`Employee Name:,${name}`);
+        lines.push(`Employee ID:,${currentEmployeeId}`);
+        if (periodLabel) {
+            lines.push(`Pay Period:,${periodLabel}`);
+        }
+        lines.push("");
+        lines.push("");
+
+        // Table header
+        lines.push("DATE,DAY,HOURS,HOLIDAY");
+        lines.push(",,,,"); // Separator line for visual clarity
+
+        // Sort rows by date (oldest first)
+        const sortedRows = [...rows].sort((a, b) => a.dateISO.localeCompare(b.dateISO));
+
+        // Add each row
+        sortedRows.forEach((r) => {
+            const date = new Date(r.dateISO + "T00:00:00");
+            const dayName = date.toLocaleDateString("en-US", { weekday: "short" });
+            const dateStr = date.toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" });
+
+            const dailyHrs = r.hours.toFixed(2);
+            const holidayName = holidays.has(r.dateISO) ? holidays.get(r.dateISO) : "";
+
+            lines.push(`${dateStr},${dayName},${dailyHrs},${holidayName}`);
+        });
+
+        // Summary section
+        lines.push("");
+        lines.push("");
+        lines.push("HOURS SUMMARY");
+        lines.push(",,,,");
+        lines.push(`Regular Hours (REG):,,${reg.toFixed(2)}`);
+        lines.push(`Overtime Hours (OT):,,${ot.toFixed(2)}`);
+        lines.push(`Holiday Hours:,,${holidayHours.toFixed(2)}`);
+        lines.push(",,,,");
+        lines.push(`TOTAL HOURS:,,${total.toFixed(2)}`);
+
+        // Create and download
         const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        const nameSuffix = showAll
-            ? "all_dates"
-            : viewMode === "weekly"
-                ? `week_${selectedWeek.iso}`
-                : `biweekly_${selectedWeek.iso}`;
-        a.download = `timecard_${currentEmployeeId}_${nameSuffix}.csv`;
+
+        const nameSuffix = selectedPayISO
+            ? `payperiod_${selectedPayISO}`
+            : selectedWeekISO
+                ? `week_${selectedWeekISO}`
+                : "all_dates";
+
+        a.download = `Timecard_${name.replace(/\s+/g, "_")}_${currentEmployeeId}_${nameSuffix}.csv`;
         a.click();
         URL.revokeObjectURL(url);
     };
@@ -783,52 +1008,43 @@ export default function EmployeeDetail() {
                             {!showAll && (
                                 <div className="mb-4">
                                     <div className="text-sm px-3 py-2 rounded-md bg-blue-50 text-blue-700 inline-block border border-blue-200">
-                                        {selectedPayISO
-                                            ? (() => {
-                                                const p = payPeriods.find((x) => x.iso === selectedPayISO);
-                                                if (!p) return "Viewing Pay Period (invalid)";
-                                                return `Viewing Pay Period (${fmtMDY(p.start)} – ${fmtMDY(
-                                                    new Date(p.endExcl.getTime() - 86400000)
-                                                )})`;
+                                        {selectedPayISO ? (() => {
+                                            const p = payPeriods.find(x => x.iso === selectedPayISO);
+                                            if (!p) return "Viewing Pay Period (invalid)";
+                                            return `Viewing Pay Period (${fmtMDY(p.start)} – ${fmtMDY(new Date(p.endExcl.getTime() - 86400000))})`;
+                                        })()
+                                            : selectedWeekISO ? (() => {
+                                                const w = weeks.find(x => x.iso === selectedWeekISO);
+                                                if (!w) return "Viewing Week (invalid)";
+                                                return `Viewing Week (${fmtMDY(w.start)} – ${fmtMDY(new Date(w.endExcl.getTime() - 86400000))})`;
                                             })()
-                                            : `Viewing: ${viewMode === "weekly" ? "This Week" : "Biweekly"
-                                            } (${weeklyNumbers.header})`}
+                                                : `Viewing: ${viewMode === "weekly" ? "This Week" : "Biweekly"}`}
                                     </div>
                                 </div>
                             )}
 
 
+
                             {/* Cards */}
                             <div className="grid grid-cols-3 gap-4 mb-6">
                                 <div className="text-center bg-green-50 p-4 rounded-lg border-2 border-green-200">
-                                    <p className="text-xs text-gray-700 font-semibold mb-1">
-                                        REG {showAll ? "" : "(this view)"}
-                                    </p>
-                                    <p className="text-2xl font-bold text-[#059669]">
-                                        {(selectedPayISO ? payPeriodNumbers.reg : weeklyNumbers.reg).toFixed(2)}
+                                    <p className="text-xs text-gray-700 font-semibold mb-1">REG {showAll ? "" : "(this view)"}</p>
+                                    <p className="text-2xl font-bold text-[#059669]">{totals.reg.toFixed(2)}</p>
+                                </div>
 
-                                    </p>
-                                </div>
                                 <div className="text-center bg-red-50 p-4 rounded-lg border-2 border-red-200">
-                                    <p className="text-xs text-gray-700 font-semibold mb-1">
-                                        OT {showAll ? "" : "(this view)"}
-                                    </p>
-                                    <p
-                                        className={`text-2xl font-bold ${weeklyNumbers.ot > 0 ? "text-red-600" : "text-gray-400"
-                                            }`}
-                                    >
-                                        {(selectedPayISO ? payPeriodNumbers.ot : weeklyNumbers.ot).toFixed(2)}
+                                    <p className="text-xs text-gray-700 font-semibold mb-1">OT {showAll ? "" : "(this view)"}</p>
+                                    <p className={`text-2xl font-bold ${totals.ot > 0 ? "text-red-600" : "text-gray-400"}`}>
+                                        {totals.ot.toFixed(2)}
                                     </p>
                                 </div>
+
                                 <div className="text-center bg-blue-50 p-4 rounded-lg border-2 border-blue-200">
-                                    <p className="text-xs text-gray-700 font-semibold mb-1">
-                                        TOTAL {showAll ? "" : "(this view)"}
-                                    </p>
-                                    <p className="text-2xl font-bold text-[#2563EB]">
-                                        {(selectedPayISO ? payPeriodNumbers.total : weeklyNumbers.total).toFixed(2)}
-                                    </p>
+                                    <p className="text-xs text-gray-700 font-semibold mb-1">TOTAL {showAll ? "" : "(this view)"}</p>
+                                    <p className="text-2xl font-bold text-[#2563EB]">{totals.total.toFixed(2)}</p>
                                 </div>
                             </div>
+
 
                             {/* Table */}
                             <div className="overflow-x-auto border-2 border-gray-200 rounded-lg relative overflow-visible">
