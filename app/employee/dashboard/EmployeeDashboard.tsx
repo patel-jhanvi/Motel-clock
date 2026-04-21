@@ -79,16 +79,21 @@ export default function EmployeeDashboard() {
 
     const handleAction = async (type: "in" | "out") => {
         if (!empId) return;
+        console.log("DEBUG:", {
+            empId,
+            employeeName,
+            role,
+        });
 
         try {
             // ✅ Create the log entry
             await addDoc(collection(db, "logs"), {
                 employeeId: empId,
-                employeeName,
-                role,
+                employeeName: employeeName || "Unknown",
+                role: role || "Employee",
                 type,
                 time: serverTimestamp(),
-                autoClockOut: false, // ✅ Added this field
+                autoClockOut: false,
             });
 
             const actionTime = new Date().toLocaleTimeString();
