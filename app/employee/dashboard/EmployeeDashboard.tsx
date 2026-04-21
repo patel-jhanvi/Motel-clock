@@ -105,7 +105,7 @@ export default function EmployeeDashboard() {
             // Return to login screen after 4 seconds
             setTimeout(() => {
                 router.push("/login");
-            }, 4000);
+            }, 24000);
         } catch (error) {
             console.error("❌ Error clocking " + type + ":", error);
             setMessage("❌ Error. Please try again or contact your manager.");
